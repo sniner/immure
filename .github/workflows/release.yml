@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+# Read-only by default; the one job that publishes a release says so itself.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-version:
+    # Tag-pushes only: refuse to release when the git tag does not match
+    # `[package].version` in Cargo.toml. Catches the classic "tagged v0.2.0 but
+    # forgot to bump Cargo.toml" before anything is published.
+    name: Verify tag matches Cargo.toml version
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare git tag with [package].version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(awk '
+              /^\[package\]/ { in_pkg=1; next }
+              /^\[/          { in_pkg=0 }
+              in_pkg && /^[[:space:]]*version[[:space:]]*=/ {
+                  gsub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "")
+                  gsub(/".*$/, "")
+                  print
+                  exit
+              }
+          ' Cargo.toml)
+          echo "Git tag (stripped):  $tag"
+          echo "Cargo.toml version:  $pkg"
+          if [ "$tag" != "$pkg" ]; then
+              echo "::error::Git tag v$tag does not match [package].version $pkg — bump Cargo.toml before tagging."
+              exit 1
+          fi
+          echo "OK: tag and Cargo.toml version match."
+
+  verify-package:
+    # A library ships as a source package, so what has to hold up is `cargo
+    # package`: the manifest metadata, the file list, and that the packaged
+    # crate builds on its own.
+    name: Verify the crate packages
+    needs: verify-version
+    if: ${{ always() && (needs.verify-version.result == 'success' || needs.verify-version.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --locked --all-features
+
+      - name: cargo package
+        run: cargo package --locked --all-features
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Extract release notes from CHANGELOG.md
+        # Release notes = the CHANGELOG section for this version. Single source
+        # of truth: the curated changelog, not a separate release-commit body.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="$version" '
+              $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+              grab && /^## \[/          { exit }
+              grab                      { print }
+          ' CHANGELOG.md | sed -e '/./,$!d' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+              echo "::error::No CHANGELOG.md section found for [$version] — add one before tagging."
+              exit 1
+          fi
+          echo "----- release notes -----"
+          cat release-notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

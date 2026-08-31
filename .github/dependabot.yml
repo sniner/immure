@@ -1,0 +1,9 @@
+# The workflows ride floating refs (`@v7`, `@stable`), which only stay safe
+# while somebody notices when they stop moving — maintainers are giving them
+# up in favour of immutable releases. This is the somebody.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

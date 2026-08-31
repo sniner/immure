@@ -1,0 +1,8 @@
+/target
+/AGENTS.md
+/CLAUDE.md
+/TODO.md
+# VIM swap files
+*.sw[a-p]
+# macOS Finder metadata
+.DS_Store

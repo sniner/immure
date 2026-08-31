@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Nothing in here writes to the repo, so nothing in here gets a token that
+# could.
+permissions:
+  contents: read
+
+# A push onto an open PR obsoletes the run already going; on main every push
+# is worth its own complete answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format & clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is in the matrix because the crate promises Windows
+        # behaviour — the write protection and `discard` getting past it —
+        # and a promise the CI never builds is only a hope.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo test
+        run: cargo test --locked --all-features
+
+  features:
+    # The zstd codec, serde and the cipher are optional, so the combinations
+    # that drop them have to compile and pass on their own — a `#[cfg]` that
+    # only ever gets built one way is a `#[cfg]` that is broken half the time.
+    # `--all-features` lives in the other jobs, so what belongs here are the
+    # combinations that leave something out.
+    name: Feature combinations
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - --no-default-features
+          - --no-default-features --features serde
+          - --no-default-features --features crypt
+          - --features serde
+          - --features crypt
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy ${{ matrix.features }}
+        run: cargo clippy --all-targets --locked ${{ matrix.features }} -- -D warnings
+
+      - name: cargo test ${{ matrix.features }}
+        run: cargo test --locked ${{ matrix.features }}
+
+  docs:
+    # Broken intra-doc links are the documentation equivalent of a compile
+    # error, and only `cargo doc` ever notices them.
+    name: Documentation
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features --locked
+
+  msrv:
+    # `rust-version` in Cargo.toml is a promise to consumers, and only a build
+    # on exactly that toolchain keeps it honest. The version here and the one
+    # in Cargo.toml move together.
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --all-targets --all-features --locked
