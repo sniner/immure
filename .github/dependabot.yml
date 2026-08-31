@@ -7,3 +7,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The ref on this action selects which *Rust* to install, not a version
+      # of the action — on the MSRV job it is the MSRV itself, and "newest" is
+      # exactly the wrong direction for it.
+      - dependency-name: dtolnay/rust-toolchain
