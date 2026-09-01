@@ -157,6 +157,15 @@ pub enum Error {
     #[error("sealed content is damaged: the key opened this entry, its bytes changed")]
     Damaged,
 
+    /// A sealed frame declares a version this build does not know.
+    ///
+    /// Written by a newer immure, and healthy: the key was never even tried.
+    /// Which is why this is neither [`Error::Unsealable`] nor
+    /// [`Error::Damaged`] — the one wrong answer here is quarantine. The
+    /// entry is fine; the build is old.
+    #[error("sealed frame version {0} is newer than this build understands")]
+    FrameVersion(u8),
+
     /// A blob is too long to seal: past 2^32 chunks of 64 KiB, or 256 TiB.
     #[error("blob is too long to seal")]
     TooManyChunks,
@@ -191,7 +200,8 @@ impl Error {
     /// [`Store::reader`](crate::Store::reader) or
     /// [`Store::reader_at`](crate::Store::reader_at), a `crypt::Opener`, a
     /// `crypt::Sealer`. When one of the crate's own answers ends such a stream
-    /// — [`Error::Damaged`], [`Error::Unsealable`], [`Error::TooManyChunks`],
+    /// — [`Error::Damaged`], [`Error::Unsealable`], [`Error::FrameVersion`],
+    /// [`Error::TooManyChunks`],
     /// [`Error::Random`] — it travels *inside* the `io::Error`, and this is
     /// how it comes back out, so that mid-stream too an entry to set aside can
     /// be told from a disk that went away. Anything genuinely I/O keeps its

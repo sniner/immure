@@ -22,6 +22,17 @@ const SEALED_CHUNK: usize = CHUNK + TAG;
 /// the chunk number and the end marker.
 const PREFIX: usize = 24 - 4 - 1;
 
+/// What every sealed blob starts with: the magic that names the format.
+const MAGIC: [u8; 4] = *b"immr";
+
+/// The frame version after the magic — the one this build writes and the only
+/// one it opens. A frame declaring a later one is refused as
+/// [`Error::FrameVersion`], never taken for damage.
+const VERSION: u8 = 1;
+
+/// Magic and version together: what lies ahead of the nonce.
+const HEADER: usize = MAGIC.len() + 1;
+
 /// The key a blob is sealed with: 32 bytes, and nothing else.
 ///
 /// Where they come from is not this crate's business. A key file, a passphrase
@@ -154,7 +165,7 @@ impl Nonce {
 /// fail here.
 pub fn seal(key: &Key, plain: &[u8]) -> Result<Vec<u8>> {
     let chunks = plain.len() / CHUNK + 1;
-    let mut out = Vec::with_capacity(Nonce::LEN + plain.len() + chunks * TAG);
+    let mut out = Vec::with_capacity(HEADER + Nonce::LEN + plain.len() + chunks * TAG);
     let mut sealer = Sealer::new(key, &mut out).map_err(unwrap_io)?;
     sealer.write_all(plain).map_err(unwrap_io)?;
     sealer.finish().map_err(unwrap_io)?;
@@ -221,8 +232,8 @@ pub struct Sealer<W: Write> {
 impl<W: Write> Sealer<W> {
     /// Seal everything written here into `dst`, under a nonce drawn now.
     ///
-    /// The nonce goes out first, before any chunk, so `dst` holds everything
-    /// unsealing needs bar the key.
+    /// The magic, the version byte and the nonce go out first, before any
+    /// chunk, so `dst` holds everything unsealing needs bar the key.
     ///
     /// # Errors
     ///
@@ -231,7 +242,11 @@ impl<W: Write> Sealer<W> {
     /// nonce that is not random is one that can repeat.
     pub fn new(key: &Key, mut dst: W) -> io::Result<Self> {
         let nonce = Nonce::random().map_err(io::Error::other)?;
-        dst.write_all(&nonce.0)?;
+        let mut head = [0u8; HEADER + Nonce::LEN];
+        head[..MAGIC.len()].copy_from_slice(&MAGIC);
+        head[MAGIC.len()] = VERSION;
+        head[HEADER..].copy_from_slice(&nonce.0);
+        dst.write_all(&head)?;
         Ok(Sealer {
             cipher: key.cipher(),
             nonce,
@@ -328,6 +343,9 @@ enum Spoiled {
     Unsealable,
     /// A later one did not, so the key is proven and the bytes are not.
     Damaged,
+    /// The frame declares a version this build does not know: written by a
+    /// newer immure, healthy, and not this build's to judge.
+    Version(u8),
     /// More chunks than the counter can name.
     TooManyChunks,
     /// The source itself failed, and this is what it said.
@@ -361,6 +379,7 @@ impl Spoiled {
         match self {
             Spoiled::Unsealable => io::Error::other(Error::Unsealable),
             Spoiled::Damaged => io::Error::other(Error::Damaged),
+            Spoiled::Version(version) => io::Error::other(Error::FrameVersion(*version)),
             Spoiled::TooManyChunks => io::Error::other(Error::TooManyChunks),
             Spoiled::Source(kind, message) => io::Error::new(*kind, message.clone()),
         }
@@ -429,16 +448,24 @@ impl<R: Read> Opener<R> {
         let nonce = if let Some(nonce) = self.nonce {
             nonce
         } else {
-            let mut bytes = [0u8; Nonce::LEN];
-            let read = match fill(&mut self.src, &mut bytes) {
+            let mut head = [0u8; HEADER + Nonce::LEN];
+            let read = match fill(&mut self.src, &mut head) {
                 Ok(read) => read,
                 Err(err) => return Err(self.spoil_source(err)),
             };
-            // Too short to hold a nonce is too short to hold anything that
-            // could authenticate, which is what a failed first chunk means.
-            if read < Nonce::LEN {
+            // Too short for the header and the nonce is too short for
+            // anything that could authenticate, which is what a failed first
+            // chunk means. Foreign magic answers the same way: whatever this
+            // is, it is not a sealed frame, and no key would change that.
+            if read < head.len() || head[..MAGIC.len()] != MAGIC {
                 return Err(self.spoil(Spoiled::failure(0)));
             }
+            let version = head[MAGIC.len()];
+            if version != VERSION {
+                return Err(self.spoil(Spoiled::Version(version)));
+            }
+            let mut bytes = [0u8; Nonce::LEN];
+            bytes.copy_from_slice(&head[HEADER..]);
             let nonce = Nonce::new(bytes);
             self.nonce = Some(nonce);
             nonce
@@ -555,8 +582,9 @@ mod tests {
         Key::new([7u8; Key::LEN])
     }
 
-    /// Where the first chunk starts: the nonce comes before it.
-    const BODY: usize = Nonce::LEN;
+    /// Where the first chunk starts: the magic, the version and the nonce
+    /// come before it.
+    const BODY: usize = HEADER + Nonce::LEN;
 
     fn roundtrip(len: usize) {
         let plain: Vec<u8> = (0..len)
@@ -629,12 +657,36 @@ mod tests {
     }
 
     #[test]
-    fn the_nonce_comes_before_the_first_chunk() {
+    fn a_sealed_blob_names_its_own_format() {
         let sealed = seal(&key(), b"").unwrap();
+        assert_eq!(sealed[..MAGIC.len()], MAGIC);
+        assert_eq!(sealed[MAGIC.len()], VERSION);
         // An empty blob is one empty chunk and its tag, and nothing else — so
-        // whatever is in front of that is the nonce and is exactly as long as
-        // one.
-        assert_eq!(sealed.len(), Nonce::LEN + TAG);
+        // what sits between the header and that is the nonce, exactly as long
+        // as one.
+        assert_eq!(sealed.len(), BODY + TAG);
+    }
+
+    #[test]
+    fn foreign_bytes_do_not_open_as_a_frame() {
+        let mut sealed = seal(&key(), b"secret").unwrap();
+        sealed[0] ^= 0x01;
+        assert!(
+            matches!(open(&key(), &sealed), Err(Error::Unsealable)),
+            "whatever this is, it is not a sealed frame, and no key would help"
+        );
+    }
+
+    #[test]
+    fn a_frame_from_the_future_is_refused_for_what_it_is() {
+        let mut sealed = seal(&key(), b"secret").unwrap();
+        sealed[MAGIC.len()] = VERSION + 1;
+        // Neither Unsealable nor Damaged: a newer immure opens this entry,
+        // and nothing must set it aside in the meantime.
+        assert!(matches!(
+            open(&key(), &sealed),
+            Err(Error::FrameVersion(version)) if version == VERSION + 1
+        ));
     }
 
     #[test]
@@ -665,14 +717,14 @@ mod tests {
         // every chunk is opened under, so touching it is as good as touching
         // the content.
         let mut sealed = seal(&key(), b"secret").unwrap();
-        sealed[2] ^= 0x01;
+        sealed[HEADER + 2] ^= 0x01;
         assert!(matches!(open(&key(), &sealed), Err(Error::Unsealable)));
     }
 
     #[test]
-    fn a_blob_too_short_to_hold_a_nonce_does_not_open_at_all() {
+    fn a_blob_too_short_to_hold_a_frame_does_not_open_at_all() {
         let sealed = seal(&key(), b"secret").unwrap();
-        for len in [0, 1, Nonce::LEN - 1] {
+        for len in [0, 1, BODY - 1] {
             assert!(
                 matches!(open(&key(), &sealed[..len]), Err(Error::Unsealable)),
                 "nothing in {len} bytes authenticates"

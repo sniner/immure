@@ -233,17 +233,20 @@ sealing — XChaCha20's extended nonce is what makes drawing at random safe
 without bookkeeping — plus the chunk's number and a flag on the last chunk, so
 chunks cannot be reordered, dropped or spliced in from another entry, and a
 file cut at a chunk boundary fails instead of reading short. The prefix
-travels in the clear ahead of the first chunk, which is all an entry stores
-besides the ciphertext; what sealing costs on disk is those 19 bytes once and
-a 16-byte Poly1305 tag per 64 KiB.
+travels in the clear ahead of the first chunk, behind a five-byte frame header
+(magic bytes and a format version) — which is all an entry stores besides the
+ciphertext; what sealing costs on disk is those 24 bytes once and a 16-byte
+Poly1305 tag per 64 KiB.
 
 **What does not change is everything else.** The name is still the hash of the
 *content*, so duplicates are still decided before a byte is sealed, and
 everything a store answers by looking at names — `find`, `contains`, `matching`,
 `entries`, `remove`, `quarantine` — works without the key. Nothing is written
-into the tree either: an entry carries the nonce it was sealed under in its own
-first bytes, so there is no key file, no manifest and no configuration to keep
-in step. A store is still nothing but the files it holds.
+into the tree either: an entry names its own frame — magic bytes, a format
+version, then the nonce it was sealed under — in its own first bytes, so there
+is no key file, no manifest and no configuration to keep in step. A store is
+still nothing but the files it holds, and a frame written by a newer immure is
+refused for what it is rather than mistaken for damage.
 
 **The key is 32 bytes and the crate does nothing else with it.** Where they come
 from — a key file, a passphrase through a password KDF, a token — is the

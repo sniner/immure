@@ -5,6 +5,17 @@
 //! functions are public so a caller that also has files to seal outside the
 //! store does not have to invent a second way of doing it.
 //!
+//! # The frame
+//!
+//! A sealed blob names its own format before anything else: four magic bytes
+//! (`immr`), one version byte, then the nonce, then the chunks. The header is
+//! read before the key is ever tried, so a frame written by a newer immure is
+//! refused for what it is — [`Error::FrameVersion`](crate::Error::FrameVersion)
+//! — rather than reported as a wrong key or as damage, which is what keeps a
+//! maintenance pass from setting aside a healthy entry it is merely too old
+//! to open. The version byte is also all the room future formats need: a
+//! later version may lay out everything after its own byte differently.
+//!
 //! # Chunks
 //!
 //! A blob is sealed in 64 KiB chunks rather than as one message, because

@@ -2421,10 +2421,11 @@ mod encryption {
         let store = sealed_store(&root, 7);
         store.add(b"the healthy one").unwrap();
         let (_, damaged) = store.add(b"about to lose its first chunk").unwrap();
-        // A byte inside the first sealed chunk, past the nonce: to a fresh
-        // handle this entry alone is indistinguishable from a wrong key.
+        // A byte inside the first sealed chunk, past the frame header and the
+        // nonce: to a fresh handle this entry alone is indistinguishable from
+        // a wrong key.
         let mut bytes = fs::read(damaged.path()).unwrap();
-        bytes[21] ^= 0x01;
+        bytes[26] ^= 0x01;
         tamper(damaged.path(), &bytes);
 
         let fresh = sealed_store(&root, 7);

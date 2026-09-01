@@ -175,9 +175,12 @@
 //! [`Store::contains`], [`Store::matching`], [`Store::entries`],
 //! [`Store::remove`], [`Store::quarantine`] — keeps working without the key.
 //! Nothing is written into the tree beyond the entries themselves: each one
-//! carries the nonce it was sealed under in its own first bytes, so there is no
-//! key file, no manifest and no configuration to keep, and a store is still
-//! nothing but the files it holds.
+//! names its own frame — magic, version byte, then the nonce it was sealed
+//! under — in its own first bytes, so there is no key file, no manifest and no
+//! configuration to keep, and a store is still nothing but the files it holds.
+//! A frame written by a newer immure is refused as [`Error::FrameVersion`]
+//! before the key is ever tried: a healthy entry, an old build, and nothing to
+//! quarantine.
 //!
 //! The key is 32 bytes and comes from the caller
 //! (`Builder::key`). Where it comes from — a key file, a
