@@ -251,11 +251,19 @@ pub struct Builder {
 impl Builder {
     /// The extension entries get, `.dat` by default.
     ///
-    /// A leading dot is optional. This is what tells entries apart from
-    /// anything else in the tree, so it is worth setting to whatever the
-    /// content actually is (`.json`, `.pdf`): a store is a lot easier to work
-    /// with by hand when `file`, `grep` and the desktop know what they are
-    /// looking at.
+    /// A leading dot is optional, and so is the whole thing: the empty
+    /// string — or a lone dot — names entries by digest alone, with only
+    /// `.zst` and `.zst.enc` ever on top. Where a store holds one kind of
+    /// content, the suffix is worth setting to what that is (`.json`,
+    /// `.pdf`): a store is a lot easier to work with by hand when `file`,
+    /// `grep` and the desktop know what they are looking at. Where it holds
+    /// anything at all, there is nothing truthful to write, and none is the
+    /// honest choice.
+    ///
+    /// Either way the digest is what tells entries from strays — a name has
+    /// to parse back into even-length hex. A bare store just casts the
+    /// widest net, so its tree should hold nothing whose name could pass for
+    /// one.
     #[must_use]
     pub fn suffix(mut self, suffix: &str) -> Self {
         self.suffix = suffix.to_string();
@@ -447,7 +455,8 @@ impl Store {
         self.layout.root()
     }
 
-    /// The extension entries carry, dot included.
+    /// The extension entries carry, dot included — empty for a store that
+    /// names entries by digest alone.
     #[must_use]
     pub fn suffix(&self) -> &str {
         self.layout.suffix()

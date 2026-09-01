@@ -6,6 +6,7 @@
 //! ```text
 //! <root>/a1/b2/a1b2c3….json      depth 2, suffix ".json"
 //! <root>/a1/a1b2c3….log.zst      depth 1, suffix ".log", compressed
+//! <root>/a1/b2/a1b2c3…           depth 2, no suffix
 //! ```
 //!
 //! Sharding exists because a quarter of a million files in one directory is
@@ -227,15 +228,21 @@ impl Layout {
     }
 }
 
-/// A suffix always starts with a dot; nothing at all means the default.
+/// A suffix starts with a dot, and there does not have to be one.
 ///
-/// Entries are told apart from strays by their suffix, so the empty string
-/// would make every file in the tree an entry. That is why it falls back
-/// rather than being honoured.
+/// The empty string — or a lone dot — is honoured as no suffix at all:
+/// entries are named by digest alone, with only `.zst` and `.zst.enc` ever
+/// on top. What tells entries from strays was never the suffix but the
+/// digest behind it — a name has to parse back into even-length hex — so a
+/// bare store only casts a wider net, it does not catch everything.
+///
+/// The default is not decided here: [`Store::builder`](crate::Store::builder)
+/// starts from [`DEFAULT_SUFFIX`], so only a caller that asked for nothing
+/// gets nothing.
 fn normalise_suffix(suffix: &str) -> String {
     let trimmed = suffix.trim();
     if trimmed.is_empty() || trimmed == "." {
-        return DEFAULT_SUFFIX.to_string();
+        return String::new();
     }
     if trimmed.starts_with('.') {
         trimmed.to_string()
@@ -260,9 +267,13 @@ mod tests {
     fn suffixes_are_normalised() {
         assert_eq!(normalise_suffix("json"), ".json");
         assert_eq!(normalise_suffix(" .json "), ".json");
-        assert_eq!(normalise_suffix(""), DEFAULT_SUFFIX);
-        assert_eq!(normalise_suffix("   "), DEFAULT_SUFFIX);
-        assert_eq!(normalise_suffix("."), DEFAULT_SUFFIX);
+        assert_eq!(normalise_suffix(""), "", "none is a valid choice");
+        assert_eq!(normalise_suffix("   "), "");
+        assert_eq!(
+            normalise_suffix("."),
+            "",
+            "a dot with nothing after it is no suffix"
+        );
     }
 
     #[test]
@@ -284,6 +295,49 @@ mod tests {
             layout("json", 0).path(&digest(), Form::Raw).unwrap(),
             Path::new("/store/aabbccddee.json"),
             "depth 0 is a flat store"
+        );
+    }
+
+    #[test]
+    fn no_suffix_names_entries_by_digest_alone() {
+        assert_eq!(
+            layout("", 2).path(&digest(), Form::Raw).unwrap(),
+            Path::new("/store/aa/bb/aabbccddee")
+        );
+        assert_eq!(
+            layout("", 1).path(&digest(), Form::Zstd).unwrap(),
+            Path::new("/store/aa/aabbccddee.zst")
+        );
+        assert_eq!(
+            layout("", 2).path(&digest(), Form::Enc).unwrap(),
+            Path::new("/store/aa/bb/aabbccddee.zst.enc"),
+            "the form tails are all that is ever on top"
+        );
+    }
+
+    #[test]
+    fn bare_names_parse_back_into_digests() {
+        let layout = layout("", 2);
+        assert_eq!(layout.parse_name("aabbccddee"), Some((digest(), Form::Raw)));
+        assert_eq!(
+            layout.parse_name("aabbccddee.zst"),
+            Some((digest(), Form::Zstd))
+        );
+        assert_eq!(
+            layout.parse_name("aabbccddee.zst.enc"),
+            Some((digest(), Form::Enc))
+        );
+        assert_eq!(layout.parse_name("notes.txt"), None, "not a digest");
+        assert_eq!(
+            layout.parse_name("aabbccddee.json"),
+            None,
+            "a dot is not hex"
+        );
+        assert_eq!(layout.parse_name("aabbccdde"), None, "odd length");
+        assert_eq!(
+            layout.parse_quarantined("aabbccddee.zst.corrupt"),
+            Some((digest(), Form::Zstd)),
+            "quarantine reads the same names"
         );
     }
 

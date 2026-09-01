@@ -300,6 +300,29 @@ fn a_suffix_without_a_dot_gets_one() {
 }
 
 #[test]
+fn a_store_can_do_without_a_suffix() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::builder(dir.path().join("cas"))
+        .suffix("")
+        .build()
+        .unwrap();
+
+    assert_eq!(store.suffix(), "");
+    let (_, entry) = store.add(b"content").unwrap();
+    assert_eq!(
+        entry.path().file_name().unwrap().to_str().unwrap(),
+        entry.digest().as_str(),
+        "the name is the digest and nothing else"
+    );
+    assert_eq!(
+        store.read(entry.digest()).unwrap().as_deref(),
+        Some(&b"content"[..])
+    );
+    assert_eq!(store.entries().count(), 1);
+    assert!(store.verify(&entry).unwrap());
+}
+
+#[test]
 fn a_store_cannot_shard_deeper_than_its_digests_reach() {
     let dir = TempDir::new().unwrap();
 
