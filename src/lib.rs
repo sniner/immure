@@ -115,7 +115,8 @@
 //! file under a name claiming to be the hash of bytes that never arrived.
 //! Nothing would find that out: a store answers "is this here?" by looking at
 //! names, not by reading them. On macOS the flush is `F_FULLFSYNC`, or `fsync`
-//! on filesystems that do not support it, such as SMB mounts.
+//! on filesystems that do not support it, such as SMB mounts. [`sync_file`]
+//! is the same flush for a file the caller writes itself.
 //!
 //! Concurrency needs no coordination: writers pick unique temporary names, and
 //! two processes storing the same bytes race to rename identical content into
@@ -232,3 +233,4 @@ pub use store::{
     Builder, Conversion, DEFAULT_DEPTH, DEFAULT_TEMP_MIN_AGE, Entries, Entry, Failure, Quarantined,
     Status, Store,
 };
+pub use temp::sync_file;

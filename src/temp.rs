@@ -137,7 +137,7 @@ impl TempFile {
     fn rename_to(mut self, dest: &Path, protection: &Protection, may_lose: bool) -> Result<()> {
         // `file_mut` only ever borrows, so the file is still here.
         let file = self.file.take().expect("temporary file is still open");
-        sync(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
+        sync_file(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
         drop(file);
 
         // Protection goes on here, on the temporary file and before the rename,
@@ -238,7 +238,7 @@ pub(crate) fn is_temp_name(name: &str) -> bool {
 fn sync_dir(path: &Path) {
     match File::open(path) {
         Ok(dir) => {
-            if let Err(err) = sync(&dir) {
+            if let Err(err) = sync_file(&dir) {
                 debug!(path = %path.display(), %err, "directory sync failed");
             }
         }
@@ -246,14 +246,20 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// Flush a file's data and metadata to the device.
+/// Flush a file's data and metadata to the device, the way the store flushes
+/// its own entries.
 ///
-/// On Apple platforms [`File::sync_all`] is `fcntl(F_FULLFSYNC)`, which also
-/// flushes the drive's write cache. smbfs rejects it with `ENOTSUP`, so without
-/// a fallback nothing could be stored on an SMB mount. A plain `fsync` there
-/// still sends everything to the server, and that is all a client can do.
-/// SQLite falls back the same way.
-fn sync(file: &File) -> io::Result<()> {
+/// This is [`File::sync_all`], except on Apple platforms. There `sync_all` is
+/// `fcntl(F_FULLFSYNC)`, which also flushes the drive's write cache, and smbfs
+/// rejects it with `ENOTSUP`. On such a filesystem the file is flushed with a
+/// plain `fsync`, which still sends everything to the server, and that is all
+/// a client can do. SQLite falls back the same way.
+///
+/// # Errors
+///
+/// The error of the flush. Only `ENOTSUP` from `F_FULLFSYNC` leads to the
+/// fallback; every other error is returned as it is.
+pub fn sync_file(file: &File) -> io::Result<()> {
     let synced = file.sync_all();
     #[cfg(target_vendor = "apple")]
     if synced.as_ref().is_err_and(full_sync_unsupported) {
@@ -307,6 +313,16 @@ mod tests {
             !full_sync_unsupported(&failed),
             "a failed flush stays a failure"
         );
+    }
+
+    #[test]
+    fn a_written_file_can_be_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("written");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(b"content").unwrap();
+        sync_file(&file).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"content");
     }
 
     #[test]

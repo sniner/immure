@@ -2,6 +2,14 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **`sync_file`**: flushes a file to the device the same way the store flushes its entries, so
+  a caller that writes a file of its own next to a store gets the same fallback to `fsync` on
+  macOS filesystems without `F_FULLFSYNC`, such as SMB mounts
+
 ## [0.3.1] - 2026-11-04
 
 ### Fixed
