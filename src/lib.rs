@@ -114,7 +114,8 @@
 //! because a rename can otherwise overtake the content it publishes and leave a
 //! file under a name claiming to be the hash of bytes that never arrived.
 //! Nothing would find that out: a store answers "is this here?" by looking at
-//! names, not by reading them.
+//! names, not by reading them. On macOS the flush is `F_FULLFSYNC`, or `fsync`
+//! on filesystems that do not support it, such as SMB mounts.
 //!
 //! Concurrency needs no coordination: writers pick unique temporary names, and
 //! two processes storing the same bytes race to rename identical content into

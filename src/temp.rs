@@ -137,8 +137,7 @@ impl TempFile {
     fn rename_to(mut self, dest: &Path, protection: &Protection, may_lose: bool) -> Result<()> {
         // `file_mut` only ever borrows, so the file is still here.
         let file = self.file.take().expect("temporary file is still open");
-        file.sync_all()
-            .ctx(|| format!("{}: flushing to device", self.path.display()))?;
+        sync(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
         drop(file);
 
         // Protection goes on here, on the temporary file and before the rename,
@@ -239,11 +238,47 @@ pub(crate) fn is_temp_name(name: &str) -> bool {
 fn sync_dir(path: &Path) {
     match File::open(path) {
         Ok(dir) => {
-            if let Err(err) = dir.sync_all() {
+            if let Err(err) = sync(&dir) {
                 debug!(path = %path.display(), %err, "directory sync failed");
             }
         }
         Err(err) => debug!(path = %path.display(), %err, "directory not open-able for sync"),
+    }
+}
+
+/// Flush a file's data and metadata to the device.
+///
+/// On Apple platforms [`File::sync_all`] is `fcntl(F_FULLFSYNC)`, which also
+/// flushes the drive's write cache. smbfs rejects it with `ENOTSUP`, so without
+/// a fallback nothing could be stored on an SMB mount. A plain `fsync` there
+/// still sends everything to the server, and that is all a client can do.
+/// SQLite falls back the same way.
+fn sync(file: &File) -> io::Result<()> {
+    let synced = file.sync_all();
+    #[cfg(target_vendor = "apple")]
+    if synced.as_ref().is_err_and(full_sync_unsupported) {
+        debug!("F_FULLFSYNC not supported by the filesystem, using fsync");
+        return fsync(file);
+    }
+    synced
+}
+
+/// Whether a failed `F_FULLFSYNC` means the filesystem does not offer it, as
+/// opposed to a flush that went wrong.
+#[cfg(target_vendor = "apple")]
+fn full_sync_unsupported(err: &io::Error) -> bool {
+    err.raw_os_error() == Some(rustix::io::Errno::NOTSUP.raw_os_error())
+}
+
+/// A plain `fsync`, retried on `EINTR` the way the standard library retries
+/// its own.
+#[cfg(target_vendor = "apple")]
+fn fsync(file: &File) -> io::Result<()> {
+    loop {
+        match rustix::fs::fsync(file) {
+            Err(rustix::io::Errno::INTR) => {}
+            other => return other.map_err(io::Error::from),
+        }
     }
 }
 
@@ -260,6 +295,18 @@ mod tests {
         assert!(path.is_file());
         drop(temp);
         assert!(!path.exists());
+    }
+
+    #[test]
+    #[cfg(target_vendor = "apple")]
+    fn only_an_unsupported_full_sync_falls_back_to_fsync() {
+        let unsupported = io::Error::from_raw_os_error(rustix::io::Errno::NOTSUP.raw_os_error());
+        let failed = io::Error::from_raw_os_error(rustix::io::Errno::IO.raw_os_error());
+        assert!(full_sync_unsupported(&unsupported), "smbfs answers ENOTSUP");
+        assert!(
+            !full_sync_unsupported(&failed),
+            "a failed flush stays a failure"
+        );
     }
 
     #[test]

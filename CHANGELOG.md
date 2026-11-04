@@ -2,6 +2,14 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- **macOS, SMB mounts**: storing an entry no longer fails with `flushing to device: Operation not
+  supported (os error 45)`. Where a filesystem does not support `F_FULLFSYNC`, the entry is
+  flushed with `fsync` instead
+
 ## [0.3.0] - 2026-09-01
 
 ### Breaking changes

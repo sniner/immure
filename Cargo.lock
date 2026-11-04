@@ -212,6 +212,7 @@ dependencies = [
  "blake3",
  "chacha20poly1305",
  "getrandom",
+ "rustix",
  "serde",
  "sha2",
  "tempfile",

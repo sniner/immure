@@ -41,5 +41,10 @@ tracing = "0.1.44"
 zeroize = { version = "1.9.0", optional = true }
 zstd = { version = "0.13.3", optional = true }
 
+# For a plain `fsync` where a filesystem does not support `F_FULLFSYNC`, which
+# is what `File::sync_all` uses on Apple platforms.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
