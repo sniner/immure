@@ -107,11 +107,14 @@ impl TempFile {
     /// Only for a `dest` that does not exist yet, which is what makes the race
     /// check in [`rename_to`](TempFile::rename_to) sound: an entry that
     /// appeared under a name nobody had taken is another writer's, holding the
-    /// same content by construction. To
-    /// write onto a name that is *already* an entry's — a key change, where the
-    /// entry keeps its name — use [`replace`](TempFile::replace), where a
-    /// rename that fails is a failure and nothing else.
-    pub(crate) fn persist(self, dest: &Path, protection: &Protection) -> Result<()> {
+    /// same content by construction. `false` says that this happened and the
+    /// other writer's entry is what lies under the name; the caller checks
+    /// it, because a rename onto a taken name is not always clean (see
+    /// `rename_to`). To write onto a name that is *already* an entry's — a
+    /// key change, where the entry keeps its name — use
+    /// [`replace`](TempFile::replace), where a rename that fails is a failure
+    /// and nothing else.
+    pub(crate) fn persist(self, dest: &Path, protection: &Protection) -> Result<bool> {
         self.rename_to(dest, protection, true)
     }
 
@@ -131,10 +134,20 @@ impl TempFile {
     /// specific to sealing.
     #[cfg(feature = "crypt")]
     pub(crate) fn replace(self, dest: &Path, protection: &Protection) -> Result<()> {
-        self.rename_to(dest, protection, false)
+        self.rename_to(dest, protection, false).map(|_| ())
     }
 
-    fn rename_to(mut self, dest: &Path, protection: &Protection, may_lose: bool) -> Result<()> {
+    /// Move the file to `dest`. `true` when it was moved, `false` when
+    /// `may_lose` and another writer's entry lies under the name.
+    ///
+    /// The name is looked at right before the rename, and `AlreadyExists`
+    /// from the rename counts as the same lost race. A rename onto a taken
+    /// name is not something to rely on: macOS over SMB replaces in two steps,
+    /// removing the old file and then renaming, and two writers doing that at
+    /// once leave one of them with `EEXIST`, or the name with an empty file.
+    /// So a name that is taken is left alone, and what lies under it is for
+    /// the caller to check.
+    fn rename_to(mut self, dest: &Path, protection: &Protection, may_lose: bool) -> Result<bool> {
         // `file_mut` only ever borrows, so the file is still here.
         let file = self.file.take().expect("temporary file is still open");
         sync_file(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
@@ -145,18 +158,22 @@ impl TempFile {
         // there is no window in between.
         protection.apply(&self.path);
 
+        if may_lose && dest.is_file() {
+            debug!(path = %dest.display(), "entry appeared while it was being written");
+            return Ok(false);
+        }
         let mut renamed = fs::rename(&self.path, dest);
         if let Err(err) = &renamed {
-            if dest.is_file() {
+            if may_lose && (err.kind() == io::ErrorKind::AlreadyExists || dest.is_file()) {
                 // Losing a race against another writer is not a failure:
                 // entries are named after their content, so whoever got there
                 // first put the same bytes in place. The temporary file stays
                 // this call's to clean up, which is what dropping unpersisted
                 // does.
-                if may_lose {
-                    debug!(path = %dest.display(), "entry appeared while it was being written");
-                    return Ok(());
-                }
+                debug!(path = %dest.display(), "entry appeared while it was being written");
+                return Ok(false);
+            }
+            if dest.is_file() {
                 // Onto a name that is meant to be taken, and refused because
                 // the file there is write-protected. Windows will not let
                 // `MoveFileEx` replace a file carrying
@@ -197,7 +214,7 @@ impl TempFile {
         if let Some(parent) = dest.parent() {
             sync_dir(parent);
         }
-        Ok(())
+        Ok(true)
     }
 }
 

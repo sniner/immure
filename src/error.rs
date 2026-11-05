@@ -188,6 +188,18 @@ pub enum Error {
     /// made.
     #[error("{}: something else is already here that cannot be accounted for", .0.display())]
     Obstructed(PathBuf),
+
+    /// The store's root directory is not there, and this store does not make
+    /// it ([`Builder::create_root`](crate::store::Builder::create_root) was
+    /// given `false`).
+    ///
+    /// A write found the root missing, or the root went away while the write
+    /// was under way: the directory was removed or renamed, and the entry was
+    /// not stored. A caller that renames store directories as a whole, to
+    /// freeze what they hold, gets this for a write that came too late and
+    /// decides where it goes instead.
+    #[error("{}: the store's directory is not there", .0.display())]
+    RootMissing(PathBuf),
 }
 
 impl Error {

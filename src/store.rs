@@ -227,6 +227,9 @@ pub struct Store {
     #[cfg(feature = "crypt")]
     key: Option<Arc<crypt::Key>>,
     protection: Protection,
+    /// Whether a write makes the root directory when it is missing; see
+    /// [`Builder::create_root`].
+    creates_root: bool,
     /// Which of an entry's three possible names to try first — see
     /// [`Store::candidates`].
     first_form: Arc<AtomicU8>,
@@ -244,6 +247,7 @@ pub struct Builder {
     depth: usize,
     algorithm: Algorithm,
     compress: bool,
+    create_root: bool,
     #[cfg(feature = "crypt")]
     key: Option<Arc<crypt::Key>>,
 }
@@ -333,6 +337,24 @@ impl Builder {
         self
     }
 
+    /// Whether a write makes the root directory when it is missing. `true`
+    /// by default: the first write into a store that is not there creates
+    /// it, shard directories included.
+    ///
+    /// With `false`, nothing below the root is made unless the root is
+    /// there: a write finds it missing and fails with
+    /// [`Error::RootMissing`], and so does a write whose root is renamed or
+    /// removed while it runs. The shard directories inside an existing root
+    /// are still made. For a caller that renames a store directory as a
+    /// whole to freeze what it holds: a writer that arrives after the rename
+    /// must not bring the directory back under its old name, which
+    /// `create_dir_all` would do.
+    #[must_use]
+    pub fn create_root(mut self, create: bool) -> Self {
+        self.create_root = create;
+        self
+    }
+
     /// Hand back the configured store, touching nothing on disk.
     ///
     /// A handle is a description of where a store lies and how it is laid out,
@@ -379,6 +401,7 @@ impl Builder {
             #[cfg(feature = "crypt")]
             key: self.key,
             protection: Protection::default(),
+            creates_root: self.create_root,
             #[cfg(feature = "crypt")]
             key_proven: Arc::new(AtomicBool::new(false)),
             // The caller's own preference is the best guess available before
@@ -420,6 +443,7 @@ impl Store {
             depth: DEFAULT_DEPTH,
             algorithm: Algorithm::default(),
             compress: false,
+            create_root: true,
             #[cfg(feature = "crypt")]
             key: None,
         }
@@ -538,11 +562,19 @@ impl Store {
     /// costs one hash and one `stat` — no writing, and the returned path is the
     /// existing entry, in whatever form it was stored.
     ///
+    /// Two writers storing the same content at once race for one name, and
+    /// the one that loses keeps nothing of its own: the entry under the name
+    /// is the other's, read back and checked against the digest before it is
+    /// answered for.
+    ///
     /// # Errors
     ///
-    /// [`Error::Io`] when the entry cannot be written, and
+    /// [`Error::Io`] when the entry cannot be written,
     /// [`Error::DigestTooShort`] when the store shards deeper than its digests
-    /// allow.
+    /// allow, [`Error::Obstructed`] when the name was taken while the entry
+    /// was being written and what lies under it is not this content, and
+    /// [`Error::RootMissing`] when the root is not there and this store does
+    /// not make it (see [`Builder::create_root`]).
     pub fn add(&self, data: &[u8]) -> Result<(Status, Entry)> {
         let digest = self.algorithm.hash(data);
         if let Some((path, form)) = self.locate(&digest)? {
@@ -571,15 +603,16 @@ impl Store {
     /// # Errors
     ///
     /// [`Error::Io`] when reading or writing fails, [`Error::KeyRequired`] for
-    /// a sealing store with no key, and [`Error::Random`] when the system will
-    /// not hand out a nonce.
+    /// a sealing store with no key, [`Error::Random`] when the system will
+    /// not hand out a nonce, and [`Error::Obstructed`] and
+    /// [`Error::RootMissing`] as for [`add`](Store::add).
     pub fn add_reader(&self, source: impl Read) -> Result<(Status, Entry)> {
         let mut source = HashingReader {
             inner: source,
             hasher: self.algorithm.hasher(),
         };
         let form = self.form();
-        let mut temp = TempFile::create_in(&self.temp_dir()?)?;
+        let mut temp = TempFile::create_in(&self.temp_dir()?).map_err(|err| self.root_gone(err))?;
         // The digest is not known yet, so there is nothing to name in the
         // message if this fails.
         self.encode(
@@ -1794,14 +1827,54 @@ impl Store {
 
     fn temp_dir(&self) -> Result<PathBuf> {
         let dir = self.root().join(temp::DIR);
-        fs::create_dir_all(&dir)
-            .ctx(|| format!("{}: creating temporary directory", dir.display()))?;
+        self.make_dir(&dir, || {
+            format!("{}: creating temporary directory", dir.display())
+        })?;
         Ok(dir)
+    }
+
+    /// Make `dir`, which lies directly or deeper under the root. With
+    /// `creates_root` the whole path is made; without it, only what is below
+    /// the root, one level at a time and never with `create_dir_all`, which
+    /// would make the root too. A root that is not there is then
+    /// [`Error::RootMissing`].
+    fn make_dir(&self, dir: &Path, context: impl Fn() -> String) -> Result<()> {
+        if self.creates_root {
+            return fs::create_dir_all(dir).ctx(context);
+        }
+        let Ok(below) = dir.strip_prefix(self.root()) else {
+            return fs::create_dir_all(dir).ctx(context);
+        };
+        let mut path = self.root().to_path_buf();
+        for component in below.components() {
+            path.push(component);
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(err) if root_is_gone(&err) => {
+                    return Err(Error::RootMissing(self.root().to_path_buf()));
+                }
+                Err(err) => return Err(err).ctx(context),
+            }
+        }
+        Ok(())
+    }
+
+    /// An error from a write, with the root missing told apart from the rest
+    /// when this store does not make the root: the directory was renamed or
+    /// removed under the writer.
+    fn root_gone(&self, err: Error) -> Error {
+        match err {
+            Error::Io { source, .. } if !self.creates_root && root_is_gone(&source) => {
+                Error::RootMissing(self.root().to_path_buf())
+            }
+            other => other,
+        }
     }
 
     /// Write new content whose digest is already known.
     fn write(&self, digest: &Digest, source: &mut impl Read) -> Result<PathBuf> {
-        let mut temp = TempFile::create_in(&self.temp_dir()?)?;
+        let mut temp = TempFile::create_in(&self.temp_dir()?).map_err(|err| self.root_gone(err))?;
         self.encode(
             source,
             &mut temp,
@@ -1848,13 +1921,25 @@ impl Store {
     }
 
     /// Move a finished temporary file into the shard it belongs in.
+    ///
+    /// When the name was taken meanwhile, the entry under it is another
+    /// writer's and is checked against the digest: the same content by
+    /// construction, unless a replace that is not atomic left something else
+    /// there, and then the name is [`Error::Obstructed`].
     fn place(&self, temp: TempFile, digest: &Digest) -> Result<PathBuf> {
         let shard = self.layout.shard(digest)?;
-        fs::create_dir_all(&shard)
-            .ctx(|| format!("{}: creating shard directory", shard.display()))?;
+        self.make_dir(&shard, || {
+            format!("{}: creating shard directory", shard.display())
+        })?;
         let path = shard.join(self.layout.file_name(digest, self.form()));
-        temp.persist(&path, &self.protection)?;
-        debug!(path = %path.display(), "entry stored");
+        let placed = temp
+            .persist(&path, &self.protection)
+            .map_err(|err| self.root_gone(err))?;
+        if placed {
+            debug!(path = %path.display(), "entry stored");
+        } else if !self.content_matches(&path, digest)? {
+            return Err(Error::Obstructed(path));
+        }
         Ok(path)
     }
 
@@ -2344,6 +2429,16 @@ impl<R: Read> Read for Proving<R> {
     }
 }
 
+/// Whether an I/O error says that a directory on the way is not there.
+/// `NotFound` and `NotADirectory` are what a renamed root looks like from a
+/// path under its old name; `ResourceBusy` is what gvfs answers for one.
+fn root_is_gone(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory | io::ErrorKind::ResourceBusy
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2414,5 +2509,58 @@ mod tests {
             !out_of_memory(&io::Error::other("Unknown frame descriptor")),
             "a rejected frame comes the same way and is the entry's fault"
         );
+    }
+
+    fn plain_store(dir: &tempfile::TempDir) -> Store {
+        Store::builder(dir.path().join("cas"))
+            .suffix(".bin")
+            .create()
+            .unwrap()
+    }
+
+    /// A temporary file holding `data`, as a write leaves it before `place`.
+    fn written(store: &Store, data: &[u8]) -> TempFile {
+        use std::io::Write as _;
+        let mut temp = TempFile::create_in(&store.temp_dir().unwrap()).unwrap();
+        temp.file_mut().write_all(data).unwrap();
+        temp
+    }
+
+    #[test]
+    fn a_lost_race_answers_for_the_other_writers_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = plain_store(&dir);
+        let digest = store.digest(b"shared");
+        let temp = written(&store, b"shared");
+        // Another writer got there first with the same content.
+        let dest = store.layout.path(&digest, store.form()).unwrap();
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"shared").unwrap();
+
+        let placed = store.place(temp, &digest).unwrap();
+
+        assert_eq!(placed, dest);
+        assert_eq!(fs::read(&dest).unwrap(), b"shared");
+        assert!(
+            store.prune_temp_files(Duration::ZERO).unwrap() == 0,
+            "the losing temporary file was removed by the loser"
+        );
+    }
+
+    #[test]
+    fn a_name_taken_by_other_bytes_obstructs_the_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = plain_store(&dir);
+        let digest = store.digest(b"shared");
+        let temp = written(&store, b"shared");
+        // What a replace that is not atomic can leave under the name.
+        let dest = store.layout.path(&digest, store.form()).unwrap();
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"").unwrap();
+
+        let err = store.place(temp, &digest).unwrap_err();
+
+        assert!(matches!(err, Error::Obstructed(path) if path == dest));
+        assert_eq!(fs::read(&dest).unwrap(), b"", "nothing was written over it");
     }
 }

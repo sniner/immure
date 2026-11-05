@@ -102,6 +102,7 @@ let store = Store::builder("/srv/store")
     .depth(2)                      // shard levels; 2 by default
     .algorithm(Algorithm::Sha256)  // SHA-256/384/512 or BLAKE3; SHA-256 by default
     .compress(false)               // zstd for new entries
+    .create_root(true)             // make the root when a write finds it missing
     .build()?;
 ```
 

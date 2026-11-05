@@ -2,6 +2,24 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **`Builder::create_root`**: with `false`, a write no longer makes the store's root directory
+  when it is missing, and fails with the new `Error::RootMissing` instead. Shard directories
+  below an existing root are still made. For a caller that renames a store directory as a
+  whole: a writer arriving after the rename does not bring the directory back under its old
+  name
+
+### Changed
+
+- **Two writers storing the same content at once**: the one that loses the race no longer
+  renames onto the name the other took. It leaves the name alone, reads the other writer's
+  entry back and checks it against the digest; an entry that does not match is reported as
+  `Error::Obstructed`. On macOS over SMB a rename onto a taken name is two steps, and two
+  writers doing it at once could leave the name with an empty file
+
 ## [0.3.2] - 2026-11-04
 
 ### Added

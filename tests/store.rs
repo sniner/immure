@@ -2436,3 +2436,55 @@ mod encryption {
         );
     }
 }
+
+// -- the root ----------------------------------------------------------------
+
+#[test]
+fn a_write_makes_a_missing_root_by_default() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::builder(dir.path().join("not").join("yet"))
+        .build()
+        .unwrap();
+
+    let (status, entry) = store.add(b"first").unwrap();
+
+    assert_eq!(status, Status::New);
+    assert!(entry.path().is_file());
+}
+
+#[test]
+fn a_store_that_does_not_make_its_root_refuses_to_write_without_one() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("cas");
+    let store = Store::builder(&root).create_root(false).build().unwrap();
+
+    let err = store.add(b"too early").unwrap_err();
+    assert!(matches!(err, Error::RootMissing(path) if path == root));
+    assert!(!root.exists(), "and did not make it on the way");
+
+    fs::create_dir(&root).unwrap();
+    let (status, entry) = store.add(b"in time").unwrap();
+    assert_eq!(status, Status::New);
+    assert!(
+        entry.path().is_file(),
+        "shard directories below the root are made"
+    );
+    assert!(store.verify(&entry).unwrap());
+
+    // The root is renamed away under the writer, as a caller freezing the
+    // directory does.
+    fs::rename(&root, dir.path().join("frozen")).unwrap();
+    let err = store.add(b"too late").unwrap_err();
+    assert!(matches!(err, Error::RootMissing(path) if path == root));
+    assert!(!root.exists(), "the write did not bring the root back");
+    assert!(
+        dir.path()
+            .join("frozen")
+            .join("tmp")
+            .read_dir()
+            .unwrap()
+            .count()
+            == 0,
+        "and left nothing behind in the renamed directory"
+    );
+}
