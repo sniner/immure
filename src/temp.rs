@@ -67,8 +67,7 @@ impl TempFile {
     }
 
     /// Where the temporary file lies, for a second pass over what was just
-    /// written to it.
-    #[cfg(feature = "crypt")]
+    /// written to it, and for a batch that flushes it later.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -78,23 +77,24 @@ impl TempFile {
         self.file.as_mut().expect("temporary file is still open")
     }
 
+    /// Close the file and keep it, for a batch that flushes and names it
+    /// later. A batch can hold more files than a process may keep open.
+    pub(crate) fn close(&mut self) {
+        self.file = None;
+    }
+
     /// Flush the finished file to the device and move it to `dest`.
     ///
     /// `dest`'s parent directory has to exist.
     ///
-    /// Both flushes are unconditional, and their order is the point. The
-    /// content reaches the device *before* the rename, or a power cut can
-    /// publish a file under a name claiming to be the hash of bytes that never
-    /// arrived — and nothing would ever find out, because a store answers "is
-    /// this entry here?" by looking at names, not by reading them. The
-    /// directory entry is flushed *after* the rename, or the bytes survive with
-    /// nothing pointing at them.
-    ///
-    /// Neither is optional. An entry that is present but wrong is
-    /// indistinguishable from a good one, and an entry that is gone was already
-    /// accounted for by whoever stored it — a caller cannot recover from either
-    /// by writing the same content again, so there is no state here worth
-    /// letting one opt into.
+    /// The order of the two flushes is the point. The content reaches the
+    /// device *before* the rename, or a power cut can publish a file under a
+    /// name claiming to be the hash of bytes that never arrived, and nothing
+    /// would find out: a store answers "is this entry here?" by looking at
+    /// names, not by reading them. The directory entry is flushed *after* the
+    /// rename, or the bytes survive with nothing pointing at them. A store in
+    /// [`Flush::Batch`](crate::Flush::Batch) keeps the same order for many
+    /// files at once and calls [`name`](TempFile::name) instead.
     ///
     /// One gap is left open deliberately. When this entry is the first of its
     /// shard, the directory holding it is itself a new name in the directory
@@ -115,11 +115,19 @@ impl TempFile {
     /// [`replace`](TempFile::replace), where a rename that fails is a failure
     /// and nothing else.
     pub(crate) fn persist(self, dest: &Path, protection: &Protection) -> Result<bool> {
-        self.rename_to(dest, protection, true)
+        self.rename_to(dest, protection, true, true)
     }
 
-    /// As [`persist`](TempFile::persist), onto a name that is expected to be
-    /// taken.
+    /// As [`persist`](TempFile::persist), without either flush: for a file the
+    /// caller has already flushed, with its directory flushed afterwards by the
+    /// caller too, or for a store that flushes only on request.
+    pub(crate) fn name(self, dest: &Path, protection: &Protection) -> Result<bool> {
+        self.rename_to(dest, protection, true, false)
+    }
+
+    /// As [`name`](TempFile::name), onto a name that is expected to be
+    /// taken. Nothing is flushed: the caller flushes the file before and the
+    /// directory after.
     ///
     /// The destination existing says nothing here — it is the point — so every
     /// rename that does not happen is reported. What does not have to be
@@ -134,11 +142,12 @@ impl TempFile {
     /// specific to sealing.
     #[cfg(feature = "crypt")]
     pub(crate) fn replace(self, dest: &Path, protection: &Protection) -> Result<()> {
-        self.rename_to(dest, protection, false).map(|_| ())
+        self.rename_to(dest, protection, false, false).map(|_| ())
     }
 
     /// Move the file to `dest`. `true` when it was moved, `false` when
-    /// `may_lose` and another writer's entry lies under the name.
+    /// `may_lose` and another writer's entry lies under the name. With
+    /// `flush`, the file is flushed before the rename and its directory after.
     ///
     /// The name is looked at right before the rename, and `AlreadyExists`
     /// from the rename counts as the same lost race. A rename onto a taken
@@ -147,11 +156,20 @@ impl TempFile {
     /// once leave one of them with `EEXIST`, or the name with an empty file.
     /// So a name that is taken is left alone, and what lies under it is for
     /// the caller to check.
-    fn rename_to(mut self, dest: &Path, protection: &Protection, may_lose: bool) -> Result<bool> {
-        // `file_mut` only ever borrows, so the file is still here.
-        let file = self.file.take().expect("temporary file is still open");
-        sync_file(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
-        drop(file);
+    fn rename_to(
+        mut self,
+        dest: &Path,
+        protection: &Protection,
+        may_lose: bool,
+        flush: bool,
+    ) -> Result<bool> {
+        // A batch closes its files after writing them; the one that is still
+        // open is closed here, before the rename.
+        if let Some(file) = self.file.take() {
+            if flush {
+                sync_file(&file).ctx(|| format!("{}: flushing to device", self.path.display()))?;
+            }
+        }
 
         // Protection goes on here, on the temporary file and before the rename,
         // so an entry is protected from the second it carries its name and
@@ -212,7 +230,9 @@ impl TempFile {
         // flushed too. Best effort: not every filesystem lets a directory be
         // opened, and the rename is atomic there regardless.
         if let Some(parent) = dest.parent() {
-            sync_dir(parent);
+            if flush {
+                sync_dir(parent);
+            }
         }
         Ok(true)
     }
@@ -284,6 +304,130 @@ pub fn sync_file(file: &File) -> io::Result<()> {
         return fsync(file);
     }
     synced
+}
+
+/// Hand a file's data and metadata to the device, without asking the device
+/// to write its cache to permanent storage.
+///
+/// On Apple platforms these are two calls: `fsync` hands the data to the
+/// drive, and `F_FULLFSYNC` also has the drive write out its cache. This is
+/// the first of them. Files handed over this way are made durable together by
+/// one [`flush_device`] afterwards, which costs the drive one cache flush
+/// instead of one per file. Elsewhere `fsync` includes the cache flush, and
+/// this is [`File::sync_all`].
+///
+/// # Errors
+///
+/// The error of the `fsync`.
+pub fn send_to_device(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        fsync(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// Have the device that holds `file` write its cache to permanent storage,
+/// and with it everything [`send_to_device`] handed it before.
+///
+/// `F_FULLFSYNC` on Apple platforms, with the fallback of [`sync_file`] to a
+/// plain `fsync` where the filesystem does not support it. Elsewhere nothing
+/// is left to do, because [`send_to_device`] already flushed.
+///
+/// # Errors
+///
+/// The error of the flush.
+pub fn flush_device(file: &File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        sync_file(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Open a finished file again, to flush it.
+///
+/// Reading is enough for a flush on Unix. Windows wants write access for
+/// `FlushFileBuffers`, and an entry there carries the read-only attribute: it
+/// is lifted for the open and put back, the handle keeps its access.
+pub(crate) fn open_to_flush(path: &Path, protection: &Protection) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        match OpenOptions::new().write(true).open(path) {
+            Err(err)
+                if err.kind() == io::ErrorKind::PermissionDenied && protect::is_read_only(path) =>
+            {
+                protect::unprotect(path);
+                let opened = OpenOptions::new().write(true).open(path);
+                protection.apply(path);
+                opened
+            }
+            opened => opened,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = protection;
+        File::open(path)
+    }
+}
+
+/// Flush the files at `paths` together: each handed to the device, then one
+/// device flush for all of them. A file that is gone is skipped when
+/// `missing_ok`, and an error otherwise.
+pub(crate) fn flush_files<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    protection: &Protection,
+    missing_ok: bool,
+) -> Result<()> {
+    let mut last = None;
+    for path in paths {
+        let file = match open_to_flush(path, protection) {
+            Ok(file) => file,
+            Err(err) if missing_ok && err.kind() == io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "gone before it was flushed");
+                continue;
+            }
+            Err(err) => {
+                return Err(err).ctx(|| format!("{}: opening to flush", path.display()));
+            }
+        };
+        send_to_device(&file).ctx(|| format!("{}: flushing to device", path.display()))?;
+        last = Some((file, path));
+    }
+    if let Some((file, path)) = last {
+        flush_device(&file).ctx(|| format!("{}: flushing the device", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Flush the directories at `paths` together, the way [`flush_files`] does
+/// files. Best effort, like the directory flush after a single entry.
+pub(crate) fn flush_dirs<'a>(paths: impl IntoIterator<Item = &'a Path>) {
+    let mut last = None;
+    for path in paths {
+        match File::open(path) {
+            Ok(dir) => {
+                if let Err(err) = send_to_device(&dir) {
+                    debug!(path = %path.display(), %err, "directory sync failed");
+                }
+                last = Some((dir, path));
+            }
+            Err(err) => debug!(path = %path.display(), %err, "directory not open-able for sync"),
+        }
+    }
+    if let Some((dir, path)) = last {
+        if let Err(err) = flush_device(&dir) {
+            debug!(path = %path.display(), %err, "device flush after the directories failed");
+        }
+    }
 }
 
 /// Whether a failed `F_FULLFSYNC` means the filesystem does not offer it, as

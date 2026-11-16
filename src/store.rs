@@ -1,10 +1,13 @@
 //! The store: add content, get it back, keep it honest.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read};
+use std::mem;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info, warn};
@@ -28,6 +31,66 @@ pub const DEFAULT_TEMP_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How many names [`Store::quarantine`] tries before giving up. Enough to get
 /// past what earlier runs set aside for content that keeps coming back damaged.
 const QUARANTINE_ATTEMPTS: usize = 100;
+
+/// The batch size of the default flush, [`Flush::Batch`].
+pub const DEFAULT_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
+
+/// When a store flushes what it writes to the device. Set with
+/// [`Builder::flush`]; [`Flush::Batch`] of [`DEFAULT_BATCH`] by default.
+///
+/// A flush is what makes a write survive a power cut or a crash of the
+/// operating system. A process that ends any other way (Ctrl-C, a panic, a
+/// kill) loses nothing it wrote, because the system writes it out on its own.
+/// The modes differ in how often the device has to write out its cache, which
+/// costs time and wears an SSD, and in what a crash of the system can leave
+/// behind.
+///
+/// The conversions ([`compress_all`](Store::compress_all) and the others)
+/// remove the file they replace, which must not happen before the new one is
+/// on the device. They replace in batches of the same size, of
+/// [`DEFAULT_BATCH`] under [`Flush::OnRequest`], and one at a time under
+/// [`Flush::Each`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flush {
+    /// Every entry is flushed before [`add`](Store::add) returns, and its
+    /// directory after the rename: two device flushes per entry.
+    Each,
+    /// Entries are written to `tmp/` and get their names in batches of this
+    /// many, and at [`Store::flush`]. The files of a batch are flushed
+    /// together, then renamed, then their directories flushed: two device
+    /// flushes per batch. A crash of the system loses the batch that was not
+    /// named yet and leaves no name on bytes that did not arrive.
+    ///
+    /// Until its batch is named, an entry is answered for like any other by
+    /// [`find`](Store::find), [`contains`](Store::contains),
+    /// [`read`](Store::read), [`reader`](Store::reader),
+    /// [`verify`](Store::verify) and [`remove`](Store::remove), and its
+    /// [`Entry`] carries the path it gets. Its file is not at that path yet,
+    /// and [`entries`](Store::entries) does not list it.
+    Batch(NonZeroUsize),
+    /// Entries get their names at once, and nothing is flushed until
+    /// [`Store::flush`]. For a run that writes many entries and can be
+    /// repeated: a crash of the system before the flush can leave names on
+    /// bytes that did not arrive, which [`verify`](Store::verify) finds.
+    OnRequest,
+}
+
+impl Default for Flush {
+    fn default() -> Self {
+        Flush::Batch(DEFAULT_BATCH)
+    }
+}
+
+impl Flush {
+    /// How many files a conversion replaces between two flushes.
+    fn conversion_batch(self) -> usize {
+        match self {
+            Flush::Each => 1,
+            Flush::Batch(size) => size.get(),
+            Flush::OnRequest => DEFAULT_BATCH.get(),
+        }
+    }
+}
 
 /// Whether [`Store::add`] found the content already there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -174,6 +237,19 @@ pub struct Conversion {
 }
 
 impl Conversion {
+    /// One entry that the pass could not move, logged and kept. Whether a
+    /// later run could is decided from the error: an entry whose seal does not
+    /// authenticate is past any run of the pass.
+    fn fail(&mut self, path: PathBuf, error: Error) {
+        let recoverable = !matches!(error, Error::Unsealable | Error::Damaged);
+        warn!(path = %path.display(), %error, recoverable, "conversion failed");
+        self.failed.push(Failure {
+            path,
+            error,
+            recoverable,
+        });
+    }
+
     /// The failures a later run could still do something about.
     ///
     /// The rest are entries no run will ever move — a file whose seal does not
@@ -218,7 +294,10 @@ pub struct Failure {
 /// to clone, safe to share across threads, and several processes can write into
 /// one store at once. The little it learns as it goes — whether write
 /// protection holds where it lies — is shared between its clones and never
-/// written down.
+/// written down. So are the entries it has written and not flushed yet (see
+/// [`Flush`]); when the last clone goes, it flushes them, the way a
+/// `BufWriter` does, and an error then is only logged. A caller that wants to
+/// hear about it calls [`flush`](Store::flush) first.
 #[derive(Debug, Clone)]
 pub struct Store {
     layout: Layout,
@@ -237,6 +316,10 @@ pub struct Store {
     /// [`Store::verify`].
     #[cfg(feature = "crypt")]
     key_proven: Arc<AtomicBool>,
+    /// When writes are flushed.
+    flush: Flush,
+    /// What was written and not flushed yet, shared between the clones.
+    pending: Arc<Mutex<Pending>>,
 }
 
 /// Configures a [`Store`]. Made by [`Store::builder`].
@@ -248,6 +331,7 @@ pub struct Builder {
     algorithm: Algorithm,
     compress: bool,
     create_root: bool,
+    flush: Flush,
     #[cfg(feature = "crypt")]
     key: Option<Arc<crypt::Key>>,
 }
@@ -355,6 +439,14 @@ impl Builder {
         self
     }
 
+    /// When the store flushes what it writes to the device; see [`Flush`].
+    /// [`Flush::Batch`] of [`DEFAULT_BATCH`] by default.
+    #[must_use]
+    pub fn flush(mut self, flush: Flush) -> Self {
+        self.flush = flush;
+        self
+    }
+
     /// Hand back the configured store, touching nothing on disk.
     ///
     /// A handle is a description of where a store lies and how it is laid out,
@@ -394,14 +486,21 @@ impl Builder {
         if form.is_encrypted() && !crypt::available() {
             return Err(Error::EncryptionUnavailable);
         }
+        let protection = Protection::default();
         Ok(Store {
             layout: Layout::new(self.root, &self.suffix, self.depth),
             algorithm: self.algorithm,
             compress: self.compress,
             #[cfg(feature = "crypt")]
             key: self.key,
-            protection: Protection::default(),
+            pending: Arc::new(Mutex::new(Pending {
+                unnamed: HashMap::new(),
+                unflushed: Vec::new(),
+                protection: protection.clone(),
+            })),
+            protection,
             creates_root: self.create_root,
+            flush: self.flush,
             #[cfg(feature = "crypt")]
             key_proven: Arc::new(AtomicBool::new(false)),
             // The caller's own preference is the best guess available before
@@ -444,6 +543,7 @@ impl Store {
             algorithm: Algorithm::default(),
             compress: false,
             create_root: true,
+            flush: Flush::default(),
             #[cfg(feature = "crypt")]
             key: None,
         }
@@ -634,8 +734,53 @@ impl Store {
                 },
             ));
         }
-        let path = self.place(temp, &digest)?;
+        let path = self.keep(temp, &digest)?;
         Ok((Status::New, Entry { digest, path, form }))
+    }
+
+    /// When this store flushes what it writes; see [`Builder::flush`].
+    #[must_use]
+    pub fn flushes(&self) -> Flush {
+        self.flush
+    }
+
+    /// A handle onto the same store that flushes the way `flush` says. It
+    /// begins with nothing written and not flushed; what it writes, it
+    /// flushes itself, apart from this handle and its clones.
+    #[must_use]
+    pub fn with_flush(&self, flush: Flush) -> Store {
+        let mut store = self.clone();
+        store.flush = flush;
+        store.pending = Arc::new(Mutex::new(Pending {
+            unnamed: HashMap::new(),
+            unflushed: Vec::new(),
+            protection: self.protection.clone(),
+        }));
+        store
+    }
+
+    /// Flush everything this store and its clones have written and not
+    /// flushed yet: name the open batch of a [`Flush::Batch`] store, flush the
+    /// entries of a [`Flush::OnRequest`] store. Nothing to do for
+    /// [`Flush::Each`], and nothing twice: what one call flushed, the next does
+    /// not see. Other handles onto the same directory are not covered.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when a file cannot be flushed or renamed, and
+    /// [`Error::Obstructed`] as for [`add`](Store::add). Entries of the batch
+    /// that were not named when the error came are not in the store.
+    pub fn flush(&self) -> Result<()> {
+        let (unnamed, unflushed) = {
+            let mut pending = self.pending();
+            (
+                mem::take(&mut pending.unnamed),
+                mem::take(&mut pending.unflushed),
+            )
+        };
+        let named = self.name_batch(unnamed);
+        let flushed = flush_named(&unflushed, &self.protection);
+        named.and(flushed)
     }
 
     /// Where the entry with this digest is, if it is there at all.
@@ -678,7 +823,7 @@ impl Store {
                 }
             }
         }
-        Ok(None)
+        Ok(self.unnamed(digest).map(|(_, dest, form)| (dest, form)))
     }
 
     /// Whether the store holds this digest.
@@ -1093,7 +1238,13 @@ impl Store {
     /// ```
     pub fn verify(&self, entry: &Entry) -> Result<bool> {
         self.own_digest(&entry.digest)?;
-        self.content_matches(&entry.path, &entry.digest)
+        // An entry of a batch is checked where its bytes are until the batch
+        // is named.
+        let written = match self.unnamed(&entry.digest) {
+            Some((temp, dest, _)) if dest == entry.path && !dest.is_file() => temp,
+            _ => entry.path.clone(),
+        };
+        self.content_matches(&written, &entry.digest)
     }
 
     /// Whether the bytes at `path` hash to `expected`, with damage answered
@@ -1385,6 +1536,11 @@ impl Store {
     ///
     /// [`Error::Io`] when the entry exists but cannot be removed.
     pub fn remove(&self, digest: &Digest) -> Result<bool> {
+        // Dropped from the batch, the temporary file goes with it.
+        if self.pending().unnamed.remove(digest).is_some() {
+            debug!(%digest, "entry removed before its batch was named");
+            return Ok(true);
+        }
         let Some(path) = self.find(digest)? else {
             return Ok(false);
         };
@@ -1578,11 +1734,11 @@ impl Store {
         let Some(old) = self.key.as_deref() else {
             return Err(Error::KeyRequired(self.root().to_path_buf()));
         };
-        self.pass(Walk::All, |entry| {
+        self.pass(Walk::All, |entry, staged| {
             if !entry.form.is_encrypted() {
                 return Ok(Step::Skipped);
             }
-            if self.reseal(entry, old, new)? {
+            if self.reseal(entry, old, new, staged)? {
                 Ok(Step::Converted)
             } else {
                 Ok(Step::Already)
@@ -1597,7 +1753,13 @@ impl Store {
     /// written, so there is nothing to carry from one seal to the other and
     /// nothing this call has to know about the rest of the run.
     #[cfg(feature = "crypt")]
-    fn reseal(&self, entry: &Entry, old: &crypt::Key, new: &crypt::Key) -> Result<bool> {
+    fn reseal(
+        &self,
+        entry: &Entry,
+        old: &crypt::Key,
+        new: &crypt::Key,
+        staged: &mut Vec<Staged>,
+    ) -> Result<bool> {
         if opens_with(&entry.path, new)? {
             return Ok(false);
         }
@@ -1627,8 +1789,15 @@ impl Store {
         // `replace`, not `persist`: the destination is this entry, so it is
         // always there, and `persist` would read every failed rename as a race
         // it lost and report an entry moved that never was.
-        temp.replace(&entry.path, &self.protection)?;
-        debug!(path = %entry.path.display(), "entry moved to the new key");
+        temp.close();
+        staged.push(Staged {
+            temp,
+            destination: entry.path.clone(),
+            digest: entry.digest.clone(),
+            replaces: Replaces::Itself,
+            entry: entry.path.clone(),
+        });
+        debug!(path = %entry.path.display(), "entry sealed under the new key");
         Ok(true)
     }
 
@@ -1807,8 +1976,25 @@ impl Store {
         self.first_form.store(form.as_u8(), Ordering::Relaxed);
     }
 
-    /// Open the entry with this digest, whichever of its two names it has.
+    /// Open the entry with this digest, whichever of its names it has, or
+    /// its temporary file while it waits in a batch.
     fn open_entry(&self, digest: &Digest) -> Result<Option<(File, Form, PathBuf)>> {
+        if let Some(found) = self.open_named(digest)? {
+            return Ok(Some(found));
+        }
+        let Some((temp, _, form)) = self.unnamed(digest) else {
+            return Ok(None);
+        };
+        match File::open(&temp) {
+            Ok(file) => Ok(Some((file, form, temp))),
+            // Named in the meantime, and under its name now.
+            Err(err) if err.kind() == io::ErrorKind::NotFound => self.open_named(digest),
+            Err(err) => Err(err).ctx(|| format!("{}: opening entry", temp.display())),
+        }
+    }
+
+    /// Open the entry with this digest under whichever of its names it has.
+    fn open_named(&self, digest: &Digest) -> Result<Option<(File, Form, PathBuf)>> {
         for (candidate, form) in self.candidates(digest)? {
             match File::open(&candidate) {
                 Ok(file) => {
@@ -1881,7 +2067,7 @@ impl Store {
             &|| format!("{digest}: sealing entry"),
             self.form(),
         )?;
-        self.place(temp, digest)
+        self.keep(temp, digest)
     }
 
     /// Put content into `temp` in the given form: compress, then seal.
@@ -1920,21 +2106,93 @@ impl Store {
         }
     }
 
-    /// Move a finished temporary file into the shard it belongs in.
+    /// Give a finished temporary file its entry's name, the way this store
+    /// flushes: at once and flushed, at once and not flushed, or with the
+    /// batch. Answers the path the entry has, or gets with its batch.
+    fn keep(&self, mut temp: TempFile, digest: &Digest) -> Result<PathBuf> {
+        let size = match self.flush {
+            Flush::Each => return self.place(temp, digest, true),
+            Flush::OnRequest => {
+                let path = self.place(temp, digest, false)?;
+                self.pending().unflushed.push(path.clone());
+                return Ok(path);
+            }
+            Flush::Batch(size) => size,
+        };
+        let dest = self.shard_path(digest)?;
+        temp.close();
+        let full = {
+            let mut pending = self.pending();
+            // Another clone may have batched the same content meanwhile. Its
+            // copy is the one that stays, and this one is dropped with its
+            // temporary file.
+            pending
+                .unnamed
+                .entry(digest.clone())
+                .or_insert_with(|| Unnamed {
+                    temp,
+                    dest: dest.clone(),
+                    form: self.form(),
+                });
+            (pending.unnamed.len() >= size.get()).then(|| mem::take(&mut pending.unnamed))
+        };
+        if let Some(batch) = full {
+            self.name_batch(batch)?;
+        }
+        Ok(dest)
+    }
+
+    /// The path an entry of this digest gets in this store's form, with its
+    /// shard directory made.
+    fn shard_path(&self, digest: &Digest) -> Result<PathBuf> {
+        let shard = self.layout.shard(digest)?;
+        self.make_dir(&shard, || {
+            format!("{}: creating shard directory", shard.display())
+        })?;
+        Ok(shard.join(self.layout.file_name(digest, self.form())))
+    }
+
+    /// Name a batch, checking an entry that another writer put under a name
+    /// first against the digest.
+    fn name_batch(&self, batch: HashMap<Digest, Unnamed>) -> Result<()> {
+        name_all(batch, &self.protection, &|path, digest| {
+            self.content_matches(path, digest)
+        })
+        .map_err(|err| self.root_gone(err))
+    }
+
+    /// The entries not flushed yet, whatever a panicking clone left there:
+    /// the lists only ever hold whole entries.
+    fn pending(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The temporary file and form of an entry that waits in the batch.
+    fn unnamed(&self, digest: &Digest) -> Option<(PathBuf, PathBuf, Form)> {
+        self.pending().unnamed.get(digest).map(|unnamed| {
+            (
+                unnamed.temp.path().to_path_buf(),
+                unnamed.dest.clone(),
+                unnamed.form,
+            )
+        })
+    }
+
+    /// Move a finished temporary file into the shard it belongs in, flushed
+    /// or not.
     ///
     /// When the name was taken meanwhile, the entry under it is another
     /// writer's and is checked against the digest: the same content by
     /// construction, unless a replace that is not atomic left something else
     /// there, and then the name is [`Error::Obstructed`].
-    fn place(&self, temp: TempFile, digest: &Digest) -> Result<PathBuf> {
-        let shard = self.layout.shard(digest)?;
-        self.make_dir(&shard, || {
-            format!("{}: creating shard directory", shard.display())
-        })?;
-        let path = shard.join(self.layout.file_name(digest, self.form()));
-        let placed = temp
-            .persist(&path, &self.protection)
-            .map_err(|err| self.root_gone(err))?;
+    fn place(&self, temp: TempFile, digest: &Digest, flush: bool) -> Result<PathBuf> {
+        let path = self.shard_path(digest)?;
+        let placed = if flush {
+            temp.persist(&path, &self.protection)
+        } else {
+            temp.name(&path, &self.protection)
+        }
+        .map_err(|err| self.root_gone(err))?;
         if placed {
             debug!(path = %path.display(), "entry stored");
         } else if !self.content_matches(&path, digest)? {
@@ -1956,9 +2214,9 @@ impl Store {
         // would quietly put a file back in the store that was found not to be
         // what it claims. `change_key` can walk them because it writes onto the
         // name it was given.
-        self.pass(Walk::Entries, |entry| match plan(entry.form) {
+        self.pass(Walk::Entries, |entry, staged| match plan(entry.form) {
             Step::Converted => self
-                .convert(entry, entry.form, target)
+                .convert(entry, entry.form, target, staged)
                 .map(|()| Step::Converted),
             settled => Ok(settled),
         })
@@ -1971,7 +2229,15 @@ impl Store {
     /// [`Conversion::failed`] and the walk goes on. Whether it was worth
     /// trying again is decided here, from the error: an entry that cannot be
     /// opened at all is past any run of this pass.
-    fn pass(&self, walk: Walk, mut step: impl FnMut(&Entry) -> Result<Step>) -> Result<Conversion> {
+    ///
+    /// `step` writes its new files and leaves them in `staged`; they replace
+    /// the old ones in batches (see [`Flush`]). A flush that fails ends the run,
+    /// with the batch's old files untouched.
+    fn pass(
+        &self,
+        walk: Walk,
+        mut step: impl FnMut(&Entry, &mut Vec<Staged>) -> Result<Step>,
+    ) -> Result<Conversion> {
         // One directory's worth at a time, its handle already closed (see
         // Entries): `step` may rename and unlink in the shard an entry came
         // from, and a store of a million entries is never held in memory
@@ -1979,29 +2245,105 @@ impl Store {
         // converted stays converted, which is the interruptibility every
         // pass already promises.
         let mut result = Conversion::default();
+        let mut staged = Vec::new();
+        let batch = self.flush.conversion_batch();
         for entry in Entries::new(self, walk) {
             let entry = entry?;
-            match step(&entry) {
+            match step(&entry, &mut staged) {
                 Ok(Step::Converted) => result.converted += 1,
                 Ok(Step::Already) => result.already += 1,
                 Ok(Step::Skipped) => result.skipped += 1,
+                Err(error) => result.fail(entry.path, error),
+            }
+            if staged.len() >= batch {
+                self.replace_staged(mem::take(&mut staged), &mut result)?;
+            }
+        }
+        self.replace_staged(staged, &mut result)?;
+        Ok(result)
+    }
+
+    /// Put the new files of a conversion in place of the old ones: flushed
+    /// together, renamed, the directories flushed, and only then the old files
+    /// removed. A file that cannot be put in place moves its entry from
+    /// `converted` to `failed`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] when the new files cannot be flushed. Nothing of the batch
+    /// is replaced then.
+    fn replace_staged(&self, staged: Vec<Staged>, result: &mut Conversion) -> Result<()> {
+        if staged.is_empty() {
+            return Ok(());
+        }
+        temp::flush_files(
+            staged.iter().map(|staged| staged.temp.path()),
+            &self.protection,
+            false,
+        )?;
+        let mut dirs = BTreeSet::new();
+        let mut placed = Vec::new();
+        for Staged {
+            temp,
+            destination,
+            digest,
+            replaces,
+            entry,
+        } in staged
+        {
+            match self.put_in_place(temp, &destination, &digest, &replaces) {
+                Ok(()) => {
+                    if let Some(dir) = destination.parent() {
+                        dirs.insert(dir.to_path_buf());
+                    }
+                    placed.push((replaces, entry));
+                }
                 Err(error) => {
-                    let recoverable = !matches!(error, Error::Unsealable | Error::Damaged);
-                    warn!(
-                        path = %entry.path.display(),
-                        %error,
-                        recoverable,
-                        "conversion failed"
-                    );
-                    result.failed.push(Failure {
-                        path: entry.path,
-                        error,
-                        recoverable,
-                    });
+                    result.converted -= 1;
+                    result.fail(entry, error);
                 }
             }
         }
-        Ok(result)
+        temp::flush_dirs(dirs.iter().map(PathBuf::as_path));
+        // The new names are on the device; the old ones can go.
+        for (replaces, entry) in placed {
+            // Without `crypt` there is no key change and one way to replace.
+            #[cfg_attr(not(feature = "crypt"), allow(clippy::infallible_destructuring_match))]
+            let source = match replaces {
+                Replaces::Other(source) => source,
+                #[cfg(feature = "crypt")]
+                Replaces::Itself => continue,
+            };
+            let removed = protect::remove_file(&source)
+                .ctx(|| format!("{}: removing converted entry", source.display()));
+            if let Err(error) = removed {
+                result.converted -= 1;
+                result.fail(entry, error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rename one new file of a conversion onto its name.
+    fn put_in_place(
+        &self,
+        temp: TempFile,
+        destination: &Path,
+        digest: &Digest,
+        replaces: &Replaces,
+    ) -> Result<()> {
+        match replaces {
+            Replaces::Other(_) => {
+                if !temp.name(destination, &self.protection)?
+                    && !self.content_matches(destination, digest)?
+                {
+                    return Err(Error::Obstructed(destination.to_path_buf()));
+                }
+                Ok(())
+            }
+            #[cfg(feature = "crypt")]
+            Replaces::Itself => temp.replace(destination, &self.protection),
+        }
     }
 
     /// Rewrite one entry into `target`, and take its old name away.
@@ -2011,7 +2353,13 @@ impl Store {
     /// and turning `.zst` into `.zst.enc` is a matter of sealing the frame that
     /// is already lying there. Unpacking and repacking it would be work for
     /// nothing.
-    fn convert(&self, entry: &Entry, from: Form, target: Form) -> Result<()> {
+    fn convert(
+        &self,
+        entry: &Entry,
+        from: Form,
+        target: Form,
+        staged: &mut Vec<Staged>,
+    ) -> Result<()> {
         let source = &entry.path;
         let shard = self.layout.shard(&entry.digest)?;
         let destination = shard.join(self.layout.file_name(&entry.digest, target));
@@ -2051,14 +2399,19 @@ impl Store {
         let payload = self.payload(source, from)?;
         let mut temp = TempFile::create_in(&self.temp_dir()?)?;
         self.repack(payload, &mut temp, &entry.digest, from, target)?;
-        // The replacement is on the device before the original goes. This is
-        // the one path in the crate where a crash could take content with it
-        // rather than merely leave it half-written: everywhere else the store
-        // only ever gains an entry.
-        temp.persist(&destination, &self.protection)?;
-
-        protect::remove_file(source)
-            .ctx(|| format!("{}: removing converted entry", source.display()))
+        // The replacement is on the device before the original goes, which
+        // `replace_staged` sees to. This is the one path in the crate where a
+        // crash could take content with it rather than merely leave it
+        // half-written: everywhere else the store only ever gains an entry.
+        temp.close();
+        staged.push(Staged {
+            temp,
+            destination,
+            digest: entry.digest.clone(),
+            replaces: Replaces::Other(source.clone()),
+            entry: entry.path.clone(),
+        });
+        Ok(())
     }
 
     /// An entry's stored bytes with nothing but its seal taken off: the zstd
@@ -2123,6 +2476,107 @@ impl Store {
             Err(Error::EncryptionUnavailable)
         }
     }
+}
+
+/// The writes of a store that are not flushed yet.
+#[derive(Debug)]
+struct Pending {
+    /// Written to `tmp/` and waiting for their names, under
+    /// [`Flush::Batch`].
+    unnamed: HashMap<Digest, Unnamed>,
+    /// Named and not flushed yet, under [`Flush::OnRequest`].
+    unflushed: Vec<PathBuf>,
+    /// The store's own, for the flush when the last clone goes.
+    protection: Protection,
+}
+
+/// An entry that waits in a batch for its name.
+#[derive(Debug)]
+struct Unnamed {
+    temp: TempFile,
+    /// The path it gets.
+    dest: PathBuf,
+    form: Form,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let unnamed = mem::take(&mut self.unnamed);
+        let unflushed = mem::take(&mut self.unflushed);
+        if unnamed.is_empty() && unflushed.is_empty() {
+            return;
+        }
+        debug!(
+            unnamed = unnamed.len(),
+            unflushed = unflushed.len(),
+            "store dropped with writes not flushed, flushing them"
+        );
+        // Nothing to check a taken name against here: the reading side of the
+        // store is gone. A name that another writer took holds its content.
+        if let Err(error) = name_all(unnamed, &self.protection, &|_, _| Ok(true)) {
+            warn!(%error, "a batch could not be named when the store was dropped");
+        }
+        if let Err(error) = flush_named(&unflushed, &self.protection) {
+            warn!(%error, "entries could not be flushed when the store was dropped");
+        }
+    }
+}
+
+/// Name a batch: its files flushed together, each renamed to its entry's
+/// name, the directories flushed together. `matches` checks an entry that
+/// another writer put under a name first. An error stops the batch; the
+/// entries not named by then are dropped with their temporary files.
+fn name_all(
+    batch: HashMap<Digest, Unnamed>,
+    protection: &Protection,
+    matches: &dyn Fn(&Path, &Digest) -> Result<bool>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    // The bytes are on the device before any of them gets a name, or a crash
+    // could leave a name on bytes that never arrived.
+    temp::flush_files(
+        batch.values().map(|unnamed| unnamed.temp.path()),
+        protection,
+        false,
+    )?;
+    let mut dirs = BTreeSet::new();
+    let named = rename_all(batch, protection, matches, &mut dirs);
+    temp::flush_dirs(dirs.iter().map(PathBuf::as_path));
+    named
+}
+
+/// The renames of [`name_all`], collecting the directories they touched.
+fn rename_all(
+    batch: HashMap<Digest, Unnamed>,
+    protection: &Protection,
+    matches: &dyn Fn(&Path, &Digest) -> Result<bool>,
+    dirs: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for (digest, Unnamed { temp, dest, .. }) in batch {
+        if temp.name(&dest, protection)? {
+            debug!(path = %dest.display(), "entry stored");
+        } else if !matches(&dest, &digest)? {
+            return Err(Error::Obstructed(dest));
+        }
+        if let Some(dir) = dest.parent() {
+            dirs.insert(dir.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+/// Flush entries that already have their names: the files together, then
+/// their directories together. An entry removed in the meantime is skipped.
+fn flush_named(paths: &[PathBuf], protection: &Protection) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    temp::flush_files(paths.iter().map(PathBuf::as_path), protection, true)?;
+    let dirs: BTreeSet<&Path> = paths.iter().filter_map(|path| path.parent()).collect();
+    temp::flush_dirs(dirs);
+    Ok(())
 }
 
 /// Compress `source` into `temp`, sealing it as it goes under `key`.
@@ -2352,6 +2806,29 @@ impl Iterator for Entries<'_> {
     }
 }
 
+/// A new file of a conversion, waiting for the flush that lets it replace the
+/// old one.
+struct Staged {
+    temp: TempFile,
+    /// The name it gets.
+    destination: PathBuf,
+    digest: Digest,
+    replaces: Replaces,
+    /// Where the entry lay when the pass met it, for the tally.
+    entry: PathBuf,
+}
+
+/// What a new file of a conversion takes the place of.
+enum Replaces {
+    /// The entry under another name, which is removed once the new file has
+    /// its own.
+    Other(PathBuf),
+    /// The entry under the same name, which the rename replaces: a key
+    /// change.
+    #[cfg(feature = "crypt")]
+    Itself,
+}
+
 /// What one entry of a pass needs, and afterwards what it got.
 ///
 /// The same three values on the way in and on the way out: a step planned as
@@ -2537,7 +3014,7 @@ mod tests {
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, b"shared").unwrap();
 
-        let placed = store.place(temp, &digest).unwrap();
+        let placed = store.place(temp, &digest, true).unwrap();
 
         assert_eq!(placed, dest);
         assert_eq!(fs::read(&dest).unwrap(), b"shared");
@@ -2558,7 +3035,7 @@ mod tests {
         fs::create_dir_all(dest.parent().unwrap()).unwrap();
         fs::write(&dest, b"").unwrap();
 
-        let err = store.place(temp, &digest).unwrap_err();
+        let err = store.place(temp, &digest, true).unwrap_err();
 
         assert!(matches!(err, Error::Obstructed(path) if path == dest));
         assert_eq!(fs::read(&dest).unwrap(), b"", "nothing was written over it");

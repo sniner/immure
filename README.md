@@ -318,15 +318,43 @@ complete. A rename within one filesystem is atomic on everything in practical
 use, so a reader sees an entry whole or not at all, and an interrupted run
 leaves a stray temporary file rather than a truncated entry.
 
-Durability is not a setting. Every entry is flushed to the device **before** the
-rename that names it, and the shard directory **after** it. The order is the
-whole point: a rename can otherwise overtake the content it publishes, and what
-appears is a file under a name claiming to be the hash of bytes that never
-arrived. Nothing would ever find out — the store answers "is this here?" by
-looking at names, not by reading them — so an entry that is present but wrong
-outlives every later chance to notice, which is not a trade a caller should be
-able to make. A flush per entry is a device round trip; a store that can lie
-about what is in it is not worth the one it saves.
+An entry's bytes are flushed to the device **before** the rename that names it,
+and the shard directory **after** it. The order is the point: a rename can
+otherwise overtake the content it publishes, and what appears is a file under a
+name claiming to be the hash of bytes that never arrived. Nothing would find
+out, because the store answers "is this here?" by looking at names, not by
+reading them.
+
+How often the device is flushed is set with `Builder::flush`:
+
+- `Flush::Batch(n)`, the default with n = 100. Entries are written to `tmp/`
+  and get their names in batches: the files of a batch are flushed together,
+  then renamed, then their directories flushed, two device flushes per batch
+  instead of two per entry. Until then an entry reads back like any other, but
+  its file is not at its path yet. A crash of the system loses the batch and
+  leaves no name on bytes that did not arrive. `Store::flush` names the open
+  batch, and so does dropping the last handle onto the store.
+- `Flush::Each`: two device flushes per entry, before `add` returns.
+- `Flush::OnRequest`: entries get their names at once, and nothing is flushed
+  until `Store::flush`. For a bulk run that can be repeated: a crash of the
+  system before the flush can leave names on bytes that did not arrive, and
+  `verify` finds them.
+
+A process that stops any other way than a crash of the system (Ctrl-C, a panic,
+a kill) loses nothing it wrote, in any mode.
+
+On macOS a device flush is `F_FULLFSYNC`, which has the drive write out its
+cache, and that is the expensive part: a drive that writes out its cache for
+every small file writes much more than the files themselves. A batch hands each
+file to the drive with a plain `fsync` and flushes the drive once. On
+filesystems without `F_FULLFSYNC`, such as SMB mounts, `fsync` is used.
+Elsewhere `fsync` flushes the device by itself. `send_to_device` and
+`flush_device` are the two halves for files a caller writes itself;
+`sync_file` is both at once.
+
+The conversions remove the file they replace, and do so only after the new one
+is flushed. They replace in batches of the store's size, 100 under
+`Flush::OnRequest`, one at a time under `Flush::Each`.
 
 Several threads and several processes can write into one store without
 coordination: temporary names are unique per writer, and two writers storing

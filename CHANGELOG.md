@@ -2,6 +2,32 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Breaking changes
+
+- **Flushing**: a store now flushes in batches by default (`Flush::Batch` of 100). A new entry
+  gets its name, and its file is at `Entry::path`, when its batch is named: after 100 entries,
+  at `Store::flush`, or when the last handle onto the store is dropped. Until then it reads back
+  like any other entry. For the behaviour of 0.3, build the store with `.flush(Flush::Each)`
+
+### Added
+
+- **`Builder::flush`** and **`Flush`**: `Each` flushes every entry before `add` returns,
+  `Batch(n)` flushes n entries together with two device flushes instead of two per entry, and
+  `OnRequest` names entries at once and flushes them only at `Store::flush`. On macOS a batch
+  costs the drive one cache flush instead of one per file
+- **`Store::flush`**, **`Store::flushes`**, and **`Store::with_flush`** for a handle onto the same
+  store that flushes another way
+- **`send_to_device`** and **`flush_device`**: the two halves of `sync_file`, for a caller that
+  flushes several files of its own together
+
+### Changed
+
+- **`compress_all`, `decompress_all`, `encrypt_all`, `decrypt_all`, `change_key`** replace entries
+  in batches of the store's batch size, 100 under `Flush::OnRequest`. The old files are removed
+  only after the new ones are flushed
+
 ## [0.3.3] - 2026-11-05
 
 ### Added

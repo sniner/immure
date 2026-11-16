@@ -3,14 +3,16 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read as _;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use immure::{Algorithm, DEFAULT_TEMP_MIN_AGE, Digest, Error, Status, Store};
+use immure::{Algorithm, DEFAULT_TEMP_MIN_AGE, Digest, Error, Flush, Status, Store};
 use tempfile::TempDir;
 
 fn store_in(dir: &TempDir) -> Store {
     Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .build()
         .unwrap()
@@ -22,6 +24,7 @@ fn store_in(dir: &TempDir) -> Store {
 fn a_suffix_that_looks_like_a_form_is_still_only_a_suffix() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".enc")
         .build()
         .unwrap();
@@ -51,6 +54,7 @@ fn a_suffix_that_looks_like_a_form_is_still_only_a_suffix() {
 fn a_compressed_entry_that_was_cut_short_is_an_answer_and_not_an_error() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -74,6 +78,7 @@ fn a_compressed_entry_that_was_cut_short_is_an_answer_and_not_an_error() {
 fn a_damaged_frame_header_is_an_answer_too() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -115,7 +120,7 @@ fn opening_a_store_does_not_create_one() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("deep/down/cas");
 
-    let store = Store::open(&root).unwrap();
+    let store = Store::builder(&root).flush(Flush::Each).build().unwrap();
 
     assert!(
         !root.exists(),
@@ -135,12 +140,12 @@ fn creating_a_store_makes_its_directory() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("deep/down/cas");
 
-    let store = Store::create(&root).unwrap();
+    let store = Store::builder(&root).flush(Flush::Each).create().unwrap();
 
     assert!(root.is_dir());
     assert_eq!(store.entries().count(), 0);
 
-    Store::create(&root).unwrap();
+    Store::builder(&root).flush(Flush::Each).create().unwrap();
     assert!(root.is_dir(), "a store that is there is left as it is");
 }
 
@@ -148,7 +153,11 @@ fn creating_a_store_makes_its_directory() {
 fn the_first_write_makes_what_it_needs() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("deep/down/cas");
-    let store = Store::builder(&root).suffix(".json").build().unwrap();
+    let store = Store::builder(&root)
+        .flush(Flush::Each)
+        .suffix(".json")
+        .build()
+        .unwrap();
 
     let (status, entry) = store.add(b"hello world").unwrap();
 
@@ -256,6 +265,7 @@ fn nothing_is_written_when_the_content_is_unreadable() {
 fn a_store_with_one_shard_level_reads_its_entries_back() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".jsonl")
         .depth(1)
         .build()
@@ -267,6 +277,233 @@ fn a_store_with_one_shard_level_reads_its_entries_back() {
     assert!(store.verify(&entry).unwrap());
 }
 
+// -- flushing ----------------------------------------------------------------
+
+fn batched_in(dir: &TempDir, size: usize) -> Store {
+    Store::builder(dir.path().join("cas"))
+        .suffix(".json")
+        .flush(Flush::Batch(NonZeroUsize::new(size).unwrap()))
+        .build()
+        .unwrap()
+}
+
+fn on_request_in(dir: &TempDir) -> Store {
+    Store::builder(dir.path().join("cas"))
+        .suffix(".json")
+        .flush(Flush::OnRequest)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn a_store_batches_by_default() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::open(dir.path().join("cas")).unwrap();
+    assert_eq!(store.flushes(), Flush::Batch(immure::DEFAULT_BATCH));
+}
+
+#[test]
+fn an_entry_of_a_batch_reads_back_before_the_batch_is_named() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+
+    let (status, entry) = store.add(b"hello world").unwrap();
+
+    assert_eq!(status, Status::New);
+    assert!(
+        !entry.path().exists(),
+        "not under its name before the flush"
+    );
+    assert_eq!(store.entries().count(), 0);
+    assert!(store.contains(entry.digest()).unwrap());
+    assert_eq!(
+        store.find(entry.digest()).unwrap().as_ref(),
+        Some(&entry.path().to_path_buf())
+    );
+    assert_eq!(
+        store.read(entry.digest()).unwrap().as_deref(),
+        Some(&b"hello world"[..])
+    );
+    assert!(store.verify(&entry).unwrap());
+
+    store.flush().unwrap();
+
+    assert_eq!(fs::read(entry.path()).unwrap(), b"hello world");
+    assert_eq!(store.entries().count(), 1);
+    assert_eq!(temp_files(store.root()).len(), 0);
+    assert!(store.verify(&entry).unwrap());
+}
+
+#[test]
+fn a_full_batch_is_named_without_being_asked() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 2);
+
+    let (_, first) = store.add(b"first").unwrap();
+    assert!(!first.path().exists());
+    let (_, second) = store.add(b"second").unwrap();
+
+    assert!(first.path().is_file());
+    assert!(second.path().is_file());
+    let (_, third) = store.add(b"third").unwrap();
+    assert!(!third.path().exists(), "the next batch has begun");
+}
+
+#[test]
+fn the_same_content_twice_in_one_batch_is_stored_once() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+
+    let (first, one) = store.add(b"twice").unwrap();
+    let (second, two) = store.add(b"twice").unwrap();
+    let (third, _) = store.add_reader(&b"twice"[..]).unwrap();
+
+    assert_eq!(first, Status::New);
+    assert_eq!(second, Status::Exists);
+    assert_eq!(third, Status::Exists);
+    assert_eq!(one, two);
+    assert_eq!(temp_files(store.root()).len(), 1, "the copies are not kept");
+    store.flush().unwrap();
+    assert_eq!(store.entries().count(), 1);
+    assert_eq!(temp_files(store.root()).len(), 0);
+}
+
+#[test]
+fn a_streamed_entry_joins_the_batch_too() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+
+    let (status, entry) = store.add_reader(&b"from a reader"[..]).unwrap();
+
+    assert_eq!(status, Status::New);
+    assert!(!entry.path().exists());
+    let mut read = String::new();
+    store
+        .reader(entry.digest())
+        .unwrap()
+        .unwrap()
+        .read_to_string(&mut read)
+        .unwrap();
+    assert_eq!(read, "from a reader");
+    store.flush().unwrap();
+    assert!(entry.path().is_file());
+}
+
+#[test]
+fn the_clones_of_a_store_share_its_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+    let clone = store.clone();
+
+    let (_, entry) = clone.add(b"by the clone").unwrap();
+    assert!(store.contains(entry.digest()).unwrap());
+    store.flush().unwrap();
+
+    assert!(entry.path().is_file());
+}
+
+#[test]
+fn a_handle_that_flushes_otherwise_keeps_its_batch_to_itself() {
+    let dir = TempDir::new().unwrap();
+    let each = store_in(&dir);
+    let batched = each.with_flush(Flush::Batch(NonZeroUsize::new(10).unwrap()));
+
+    let (_, entry) = batched.add(b"in the other handle's batch").unwrap();
+
+    assert_eq!(each.flushes(), Flush::Each);
+    assert!(
+        !each.contains(entry.digest()).unwrap(),
+        "not under its name yet"
+    );
+    each.flush().unwrap();
+    assert!(!entry.path().exists(), "not this handle's to name");
+    batched.flush().unwrap();
+    assert!(each.contains(entry.digest()).unwrap());
+}
+
+#[test]
+fn a_store_that_is_dropped_names_its_batch() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+    let (_, entry) = store.add(b"left in the batch").unwrap();
+
+    drop(store);
+
+    assert_eq!(fs::read(entry.path()).unwrap(), b"left in the batch");
+}
+
+#[test]
+fn an_entry_removed_from_its_batch_leaves_nothing_behind() {
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 10);
+    let (_, entry) = store.add(b"short-lived").unwrap();
+
+    assert!(store.remove(entry.digest()).unwrap());
+
+    assert!(!store.contains(entry.digest()).unwrap());
+    assert_eq!(temp_files(store.root()).len(), 0);
+    store.flush().unwrap();
+    assert!(!entry.path().exists());
+}
+
+#[test]
+fn an_entry_flushed_on_request_has_its_name_at_once() {
+    let dir = TempDir::new().unwrap();
+    let store = on_request_in(&dir);
+
+    let (_, entry) = store.add(b"named at once").unwrap();
+
+    assert_eq!(fs::read(entry.path()).unwrap(), b"named at once");
+    assert_eq!(temp_files(store.root()).len(), 0);
+    store.flush().unwrap();
+    store.flush().unwrap();
+}
+
+#[test]
+fn a_flush_on_request_passes_over_an_entry_removed_since() {
+    let dir = TempDir::new().unwrap();
+    let store = on_request_in(&dir);
+    let (_, kept) = store.add(b"kept").unwrap();
+    let (_, gone) = store.add(b"gone").unwrap();
+
+    assert!(store.remove(gone.digest()).unwrap());
+
+    store.flush().unwrap();
+    assert!(kept.path().is_file());
+}
+
+#[test]
+#[cfg(feature = "zstd")]
+fn a_conversion_in_batches_replaces_every_entry() {
+    for store in [
+        |dir: &TempDir| batched_in(dir, 2),
+        |dir: &TempDir| on_request_in(dir),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let entries: Vec<_> = (0..5)
+            .map(|n| store.add(format!("entry {n}").as_bytes()).unwrap().1)
+            .collect();
+        store.flush().unwrap();
+
+        let compressed = store.compress_all().unwrap();
+
+        assert_eq!(compressed.converted, 5);
+        assert!(compressed.is_finished());
+        assert_eq!(temp_files(store.root()).len(), 0);
+        for (n, entry) in entries.iter().enumerate() {
+            assert!(!entry.path().exists(), "the plain file is gone");
+            assert_eq!(
+                store.read(entry.digest()).unwrap().unwrap(),
+                format!("entry {n}").as_bytes()
+            );
+        }
+        let walked: Vec<_> = store.entries().map(Result::unwrap).collect();
+        assert_eq!(walked.len(), 5);
+        assert!(walked.iter().all(immure::Entry::is_compressed));
+    }
+}
+
 // -- layout ------------------------------------------------------------------
 
 #[test]
@@ -274,6 +511,7 @@ fn depth_decides_how_deeply_entries_are_sharded() {
     for depth in [0, 1, 2, 3] {
         let dir = TempDir::new().unwrap();
         let store = Store::builder(dir.path().join("cas"))
+            .flush(Flush::Each)
             .depth(depth)
             .build()
             .unwrap();
@@ -290,6 +528,7 @@ fn depth_decides_how_deeply_entries_are_sharded() {
 fn a_suffix_without_a_dot_gets_one() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix("json")
         .build()
         .unwrap();
@@ -303,6 +542,7 @@ fn a_suffix_without_a_dot_gets_one() {
 fn a_store_can_do_without_a_suffix() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix("")
         .build()
         .unwrap();
@@ -327,6 +567,7 @@ fn a_store_cannot_shard_deeper_than_its_digests_reach() {
     let dir = TempDir::new().unwrap();
 
     let err = Store::builder(dir.path())
+        .flush(Flush::Each)
         .algorithm(Algorithm::Sha256)
         .depth(33)
         .build()
@@ -339,6 +580,7 @@ fn a_store_cannot_shard_deeper_than_its_digests_reach() {
 fn a_digest_from_another_algorithm_is_refused_rather_than_misfiled() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .algorithm(Algorithm::Sha384)
         .depth(4)
         .build()
@@ -361,13 +603,14 @@ fn the_wrong_algorithm_is_told_before_it_answers_wrongly() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
     let old = Store::builder(&root)
+        .flush(Flush::Each)
         .algorithm(Algorithm::Sha384)
         .build()
         .unwrap();
     let (_, entry) = old.add(b"named before the default changed").unwrap();
 
     // The same store, opened with the default algorithm instead of its own.
-    let wrong = Store::open(&root).unwrap();
+    let wrong = Store::builder(&root).flush(Flush::Each).build().unwrap();
 
     // Refused rather than answered wrongly: a lookup would find nothing where
     // the entry lies, and a `false` from verify would send a healthy entry to
@@ -383,6 +626,7 @@ fn the_wrong_algorithm_is_told_before_it_answers_wrongly() {
 
     // Opened with its own algorithm, the store answers as it always did.
     let right = Store::builder(&root)
+        .flush(Flush::Each)
         .algorithm(Algorithm::Sha384)
         .build()
         .unwrap();
@@ -397,6 +641,7 @@ fn the_wrong_algorithm_is_told_before_it_answers_wrongly() {
 fn any_algorithm_can_name_the_entries() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .algorithm(Algorithm::Blake3)
         .build()
         .unwrap();
@@ -514,8 +759,13 @@ fn an_entry_can_be_read_by_its_digest_alone() {
 fn reading_by_digest_follows_whichever_form_is_there() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    let plain = Store::builder(&root).suffix(".json").build().unwrap();
+    let plain = Store::builder(&root)
+        .flush(Flush::Each)
+        .suffix(".json")
+        .build()
+        .unwrap();
     let zstd = Store::builder(&root)
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -678,10 +928,12 @@ fn a_beginning_too_short_to_look_up_says_how_much_is_needed() {
 fn how_much_of_a_name_is_needed_follows_the_depth() {
     let dir = TempDir::new().unwrap();
     let shallow = Store::builder(dir.path().join("one"))
+        .flush(Flush::Each)
         .depth(1)
         .build()
         .unwrap();
     let flat = Store::builder(dir.path().join("flat"))
+        .flush(Flush::Each)
         .depth(0)
         .build()
         .unwrap();
@@ -732,6 +984,7 @@ fn a_path_says_which_entry_it_is() {
 fn a_compressed_entry_says_so_as_well() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -1247,6 +1500,7 @@ fn a_reader_hands_over_as_much_as_the_caller_asks_for() {
 fn a_compressed_entry_is_decompressed_only_as_far_as_it_is_read() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -1272,6 +1526,7 @@ fn a_build_without_zstd_refuses_to_compress_rather_than_pretending() {
     if !immure::compression_available() {
         let dir = TempDir::new().unwrap();
         let err = Store::builder(dir.path())
+            .flush(Flush::Each)
             .compress(true)
             .build()
             .unwrap_err();
@@ -1284,6 +1539,7 @@ fn a_build_without_zstd_refuses_to_compress_rather_than_pretending() {
 fn compressed_entries_round_trip_and_keep_their_uncompressed_name() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("cas"))
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -1308,8 +1564,13 @@ fn compressed_entries_round_trip_and_keep_their_uncompressed_name() {
 fn the_two_forms_find_each_other() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    let plain = Store::builder(&root).suffix(".json").build().unwrap();
+    let plain = Store::builder(&root)
+        .flush(Flush::Each)
+        .suffix(".json")
+        .build()
+        .unwrap();
     let zstd = Store::builder(&root)
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -1384,8 +1645,13 @@ fn a_whole_store_can_be_compressed_and_uncompressed_again() {
 fn converting_a_mixed_store_touches_only_what_needs_it() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    let plain = Store::builder(&root).suffix(".json").build().unwrap();
+    let plain = Store::builder(&root)
+        .flush(Flush::Each)
+        .suffix(".json")
+        .build()
+        .unwrap();
     let zstd = Store::builder(&root)
+        .flush(Flush::Each)
         .suffix(".json")
         .compress(true)
         .build()
@@ -1445,7 +1711,7 @@ fn temp_files(root: &std::path::Path) -> Vec<PathBuf> {
 #[cfg(feature = "crypt")]
 mod encryption {
     use super::{TempDir, file_name, tamper};
-    use immure::{Error, Key, Status, Store};
+    use immure::{Error, Flush, Key, Status, Store};
     use std::fs;
     use std::io::Read as _;
     use std::path::Path;
@@ -1456,6 +1722,7 @@ mod encryption {
 
     fn sealed_store(root: &Path, byte: u8) -> Store {
         Store::builder(root)
+            .flush(Flush::Each)
             .suffix(".json")
             .key(key(byte))
             .build()
@@ -1503,6 +1770,7 @@ mod encryption {
     fn the_name_is_still_the_digest_of_the_content() {
         let dir = TempDir::new().unwrap();
         let plain = Store::builder(dir.path().join("plain"))
+            .flush(Flush::Each)
             .suffix(".json")
             .build()
             .unwrap();
@@ -1580,7 +1848,11 @@ mod encryption {
         let root = dir.path().join("cas");
         let (_, entry) = sealed_store(&root, 1).add(b"content").unwrap();
 
-        let keyless = Store::builder(&root).suffix(".json").build().unwrap();
+        let keyless = Store::builder(&root)
+            .flush(Flush::Each)
+            .suffix(".json")
+            .build()
+            .unwrap();
 
         assert!(
             keyless.contains(entry.digest()).unwrap(),
@@ -1710,8 +1982,13 @@ mod encryption {
     fn all_three_forms_live_in_one_store_and_are_all_found() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
-        let raw = Store::builder(&root).suffix(".json").build().unwrap();
+        let raw = Store::builder(&root)
+            .flush(Flush::Each)
+            .suffix(".json")
+            .build()
+            .unwrap();
         let zstd = Store::builder(&root)
+            .flush(Flush::Each)
             .suffix(".json")
             .compress(true)
             .build()
@@ -1741,7 +2018,11 @@ mod encryption {
     fn a_whole_store_can_be_sealed_afterwards() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
-        let plain = Store::builder(&root).suffix(".json").build().unwrap();
+        let plain = Store::builder(&root)
+            .flush(Flush::Each)
+            .suffix(".json")
+            .build()
+            .unwrap();
         let digests: Vec<_> = (0..3)
             .map(|n| {
                 plain
@@ -2086,7 +2367,11 @@ mod encryption {
     fn a_key_change_leaves_what_is_not_sealed_alone() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
-        let plain = Store::builder(&root).suffix(".json").build().unwrap();
+        let plain = Store::builder(&root)
+            .flush(Flush::Each)
+            .suffix(".json")
+            .build()
+            .unwrap();
         let (_, plain_entry) = plain.add(b"never was sealed").unwrap();
 
         let sealed = sealed_store(&root, 1);
@@ -2106,6 +2391,7 @@ mod encryption {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
         let plain = Store::builder(&root)
+            .flush(Flush::Each)
             .suffix(".json")
             .compress(true)
             .build()
@@ -2134,6 +2420,7 @@ mod encryption {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
         let plain = Store::builder(&root)
+            .flush(Flush::Each)
             .suffix(".json")
             .compress(true)
             .build()
@@ -2168,6 +2455,7 @@ mod encryption {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
         let plain = Store::builder(&root)
+            .flush(Flush::Each)
             .suffix(".json")
             .compress(true)
             .build()
@@ -2289,6 +2577,7 @@ mod encryption {
     fn a_store_without_a_key_refuses_to_seal() {
         let dir = TempDir::new().unwrap();
         let store = Store::builder(dir.path().join("cas"))
+            .flush(Flush::Each)
             .suffix(".json")
             .build()
             .unwrap();
@@ -2392,6 +2681,7 @@ mod encryption {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("cas");
         Store::builder(&root)
+            .flush(Flush::Each)
             .suffix(".json")
             .build()
             .unwrap()
@@ -2406,7 +2696,10 @@ mod encryption {
     #[test]
     fn proving_needs_a_key() {
         let dir = TempDir::new().unwrap();
-        let store = Store::builder(dir.path().join("cas")).build().unwrap();
+        let store = Store::builder(dir.path().join("cas"))
+            .flush(Flush::Each)
+            .build()
+            .unwrap();
 
         assert!(matches!(
             store.prove_key().unwrap_err(),
@@ -2443,6 +2736,7 @@ mod encryption {
 fn a_write_makes_a_missing_root_by_default() {
     let dir = TempDir::new().unwrap();
     let store = Store::builder(dir.path().join("not").join("yet"))
+        .flush(Flush::Each)
         .build()
         .unwrap();
 
@@ -2456,7 +2750,11 @@ fn a_write_makes_a_missing_root_by_default() {
 fn a_store_that_does_not_make_its_root_refuses_to_write_without_one() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("cas");
-    let store = Store::builder(&root).create_root(false).build().unwrap();
+    let store = Store::builder(&root)
+        .flush(Flush::Each)
+        .create_root(false)
+        .build()
+        .unwrap();
 
     let err = store.add(b"too early").unwrap_err();
     assert!(matches!(err, Error::RootMissing(path) if path == root));

@@ -109,14 +109,30 @@
 //! reader sees an entry whole or not at all, and an interrupted run leaves a
 //! stray temporary file rather than a truncated entry.
 //!
-//! Durability is not a setting. Each entry reaches the device before the rename
-//! that names it, and the directory entry is flushed after — in that order,
-//! because a rename can otherwise overtake the content it publishes and leave a
-//! file under a name claiming to be the hash of bytes that never arrived.
-//! Nothing would find that out: a store answers "is this here?" by looking at
-//! names, not by reading them. On macOS the flush is `F_FULLFSYNC`, or `fsync`
-//! on filesystems that do not support it, such as SMB mounts. [`sync_file`]
-//! is the same flush for a file the caller writes itself.
+//! An entry's bytes reach the device before the rename that names it, and the
+//! directory entry is flushed after, in that order: a rename can otherwise
+//! overtake the content it publishes and leave a file under a name claiming to
+//! be the hash of bytes that never arrived. Nothing would find that out,
+//! because a store answers "is this here?" by looking at names, not by reading
+//! them.
+//!
+//! How often the device is flushed is a setting, [`Flush`]. By default entries
+//! are written to `tmp/` and named in batches of [`DEFAULT_BATCH`]: the files
+//! of a batch are flushed together, then renamed, then their directories
+//! flushed, two device flushes per batch. Until then an entry reads back like
+//! any other, but its file is not at its path yet; [`Store::flush`] names the
+//! open batch, and so does dropping the last handle. [`Flush::Each`] flushes
+//! every entry before [`Store::add`] returns, and [`Flush::OnRequest`] names
+//! entries at once and flushes nothing until asked. A process that stops any
+//! other way than a crash of the system loses nothing it wrote, in any mode.
+//!
+//! On macOS a device flush is `F_FULLFSYNC`, which has the drive write out its
+//! cache; a batch hands each file to the drive with a plain `fsync` and flushes
+//! the drive once. On filesystems without `F_FULLFSYNC`, such as SMB mounts,
+//! `fsync` is used. Elsewhere `fsync` flushes the device by itself, and a batch
+//! saves the waiting rather than the flushes. [`send_to_device`] and
+//! [`flush_device`] are the two halves for files the caller writes itself, and
+//! [`sync_file`] is both at once.
 //!
 //! Concurrency needs no coordination: writers pick unique temporary names, and
 //! two processes storing the same bytes race to rename identical content into
@@ -230,7 +246,7 @@ pub use digest::{Algorithm, Digest, Hasher};
 pub use error::{Error, Result};
 pub use layout::{DEFAULT_SUFFIX, QUARANTINE_SUFFIX};
 pub use store::{
-    Builder, Conversion, DEFAULT_DEPTH, DEFAULT_TEMP_MIN_AGE, Entries, Entry, Failure, Quarantined,
-    Status, Store,
+    Builder, Conversion, DEFAULT_BATCH, DEFAULT_DEPTH, DEFAULT_TEMP_MIN_AGE, Entries, Entry,
+    Failure, Flush, Quarantined, Status, Store,
 };
-pub use temp::sync_file;
+pub use temp::{flush_device, send_to_device, sync_file};
