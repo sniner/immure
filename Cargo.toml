@@ -7,7 +7,6 @@ authors = ["Stefan Schönberger <stefan@sniner.dev>"]
 license = "Apache-2.0"
 description = "Content-addressed file storage: entries are named by the hash of their content, sharded, immutable, optionally zstd-compressed and encrypted"
 repository = "https://github.com/sniner/immure"
-homepage = "https://github.com/sniner/immure"
 keywords = ["content-addressed", "storage", "cas", "deduplication", "hash"]
 categories = ["filesystem", "data-structures"]
 readme = "README.md"
