@@ -2,6 +2,14 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- **`flush_together` failed on Windows** with "Access is denied": it opened the files for reading,
+  and a flush needs write access there. A directory is passed over on Windows, where it cannot
+  be flushed
+
 ## [0.4.2] - 2026-11-17
 
 ### Added

@@ -488,15 +488,39 @@ pub(crate) fn flush_dirs<'a>(paths: impl IntoIterator<Item = &'a Path>) {
 /// Btrfs, F2FS or ZFS, and every path has to lie on that same filesystem.
 /// `syncfs` reports a failed write only since Linux 5.8.
 ///
+/// On Windows a file is opened for writing, which a flush needs there, so a
+/// read-only file is an error; a directory cannot be flushed and is passed
+/// over.
+///
 /// # Errors
 ///
-/// The error of opening a path for reading, or of a flush.
+/// The error of opening a path, or of a flush.
 pub fn flush_together<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> io::Result<()> {
     let mut together = Together::new();
     for path in paths {
-        together.add(File::open(path)?)?;
+        if let Some(file) = open_own(path.as_ref())? {
+            together.add(file)?;
+        }
     }
     together.finish()
+}
+
+/// Open a file or directory of the caller to flush it; `None` for what the
+/// platform cannot flush.
+fn open_own(path: &Path) -> io::Result<Option<File>> {
+    #[cfg(windows)]
+    {
+        // `FlushFileBuffers` wants write access, and a directory opens only
+        // with flags the standard library does not set.
+        if path.is_dir() {
+            return Ok(None);
+        }
+        OpenOptions::new().write(true).open(path).map(Some)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path).map(Some)
+    }
 }
 
 /// Whether `syncfs` on `file` makes every file of its filesystem durable,
