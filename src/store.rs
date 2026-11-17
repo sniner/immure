@@ -48,8 +48,8 @@ pub const DEFAULT_BATCH: NonZeroUsize = NonZeroUsize::new(100).unwrap();
 /// The conversions ([`compress_all`](Store::compress_all) and the others)
 /// remove the file they replace, which must not happen before the new one is
 /// on the device. They replace in batches of the same size, of
-/// [`DEFAULT_BATCH`] under [`Flush::OnRequest`], and one at a time under
-/// [`Flush::Each`].
+/// [`DEFAULT_BATCH`] under [`Flush::OnRequest`] and [`Flush::Never`], and one
+/// at a time under [`Flush::Each`]. A conversion flushes in every mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flush {
     /// Every entry is flushed before [`add`](Store::add) returns, and its
@@ -73,6 +73,14 @@ pub enum Flush {
     /// repeated: a crash of the system before the flush can leave names on
     /// bytes that did not arrive, which [`verify`](Store::verify) finds.
     OnRequest,
+    /// Entries get their names at once, and the store never flushes them:
+    /// [`Store::flush`] does nothing, and neither does dropping the last
+    /// handle. The system writes the files out on its own, usually within a
+    /// minute. A crash of the system before that can leave names on bytes
+    /// that did not arrive, which [`verify`](Store::verify) finds. For a
+    /// caller that records elsewhere what it stored, flushes that record,
+    /// and can store the content again.
+    Never,
 }
 
 impl Default for Flush {
@@ -87,7 +95,7 @@ impl Flush {
         match self {
             Flush::Each => 1,
             Flush::Batch(size) => size.get(),
-            Flush::OnRequest => DEFAULT_BATCH.get(),
+            Flush::OnRequest | Flush::Never => DEFAULT_BATCH.get(),
         }
     }
 }
@@ -297,7 +305,8 @@ pub struct Failure {
 /// written down. So are the entries it has written and not flushed yet (see
 /// [`Flush`]); when the last clone goes, it flushes them, the way a
 /// `BufWriter` does, and an error then is only logged. A caller that wants to
-/// hear about it calls [`flush`](Store::flush) first.
+/// hear about it calls [`flush`](Store::flush) first. A [`Flush::Never`]
+/// store keeps no such list and flushes nothing.
 #[derive(Debug, Clone)]
 pub struct Store {
     layout: Layout,
@@ -762,8 +771,8 @@ impl Store {
     /// Flush everything this store and its clones have written and not
     /// flushed yet: name the open batch of a [`Flush::Batch`] store, flush the
     /// entries of a [`Flush::OnRequest`] store. Nothing to do for
-    /// [`Flush::Each`], and nothing twice: what one call flushed, the next does
-    /// not see. Other handles onto the same directory are not covered.
+    /// [`Flush::Each`] and [`Flush::Never`], and nothing twice: what one call
+    /// flushed, the next does not see. Other handles onto the same directory are not covered.
     ///
     /// # Errors
     ///
@@ -2119,6 +2128,7 @@ impl Store {
                 self.pending().unflushed.push(path.clone());
                 return Ok(path);
             }
+            Flush::Never => return self.place(temp, digest, false),
             Flush::Batch(size) => size,
         };
         let dest = self.shard_path(digest)?;

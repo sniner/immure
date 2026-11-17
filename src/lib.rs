@@ -122,8 +122,9 @@
 //! flushed, two device flushes per batch. Until then an entry reads back like
 //! any other, but its file is not at its path yet; [`Store::flush`] names the
 //! open batch, and so does dropping the last handle. [`Flush::Each`] flushes
-//! every entry before [`Store::add`] returns, and [`Flush::OnRequest`] names
-//! entries at once and flushes nothing until asked. A process that stops any
+//! every entry before [`Store::add`] returns, [`Flush::OnRequest`] names
+//! entries at once and flushes nothing until asked, and [`Flush::Never`] names
+//! entries at once and never flushes them. A process that stops any
 //! other way than a crash of the system loses nothing it wrote, in any mode.
 //!
 //! On macOS a device flush is `F_FULLFSYNC`, which has the drive write out its

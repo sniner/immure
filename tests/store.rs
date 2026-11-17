@@ -296,6 +296,59 @@ fn on_request_in(dir: &TempDir) -> Store {
 }
 
 #[test]
+fn a_store_that_never_flushes_names_entries_at_once() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::builder(dir.path().join("cas"))
+        .suffix(".json")
+        .flush(Flush::Never)
+        .build()
+        .unwrap();
+
+    let (status, entry) = store.add(b"hello world").unwrap();
+
+    assert_eq!(status, Status::New);
+    assert!(entry.path().is_file(), "under its name before any flush");
+    assert_eq!(temp_files(store.root()), Vec::<PathBuf>::new());
+    assert!(store.verify(&entry).unwrap());
+    assert_eq!(store.add(b"hello world").unwrap().0, Status::Exists);
+}
+
+#[test]
+fn a_flush_of_a_store_that_never_flushes_does_nothing() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::builder(dir.path().join("cas"))
+        .suffix(".json")
+        .flush(Flush::Never)
+        .build()
+        .unwrap();
+    let (_, entry) = store.add(b"hello world").unwrap();
+
+    store.flush().unwrap();
+
+    assert!(store.verify(&entry).unwrap());
+}
+
+#[test]
+#[cfg(feature = "zstd")]
+fn a_store_that_never_flushes_still_converts() {
+    let dir = TempDir::new().unwrap();
+    let store = Store::builder(dir.path().join("cas"))
+        .suffix(".json")
+        .flush(Flush::Never)
+        .build()
+        .unwrap();
+    let (_, entry) = store.add(&[b'a'; 4096]).unwrap();
+
+    let converted = store.compress_all().unwrap();
+
+    assert_eq!(converted.converted, 1);
+    assert_eq!(
+        store.read(entry.digest()).unwrap().as_deref(),
+        Some(&[b'a'; 4096][..])
+    );
+}
+
+#[test]
 fn a_store_batches_by_default() {
     let dir = TempDir::new().unwrap();
     let store = Store::open(dir.path().join("cas")).unwrap();

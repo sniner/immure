@@ -2,6 +2,20 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Breaking changes
+
+- **`Flush` has a new variant, `Flush::Never`.** A `match` over `Flush` without a wildcard arm no
+  longer compiles; add an arm for it
+
+### Added
+
+- **`Flush::Never`**: entries get their names at once and the store never flushes them, not at
+  `Store::flush` and not when the last handle is dropped. For a program that records elsewhere
+  what it stored, flushes that record, and can store the content again. The conversions still
+  flush before they remove a file
+
 ## [0.4.3] - 2026-11-17
 
 ### Fixed

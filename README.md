@@ -339,6 +339,12 @@ How often the device is flushed is set with `Builder::flush`:
   until `Store::flush`. For a bulk run that can be repeated: a crash of the
   system before the flush can leave names on bytes that did not arrive, and
   `verify` finds them.
+- `Flush::Never`: entries get their names at once, and the store never flushes
+  them, not at `Store::flush` and not when the last handle is dropped. The
+  system writes the files out on its own, usually within a minute; a crash of
+  the system before that can leave names on bytes that did not arrive, and
+  `verify` finds them. For a program that records elsewhere what it stored,
+  flushes that record, and can store the content again.
 
 A process that stops any other way than a crash of the system (Ctrl-C, a panic,
 a kill) loses nothing it wrote, in any mode.
@@ -353,8 +359,8 @@ Elsewhere `fsync` flushes the device by itself. `send_to_device` and
 `sync_file` is both at once.
 
 The conversions remove the file they replace, and do so only after the new one
-is flushed. They replace in batches of the store's size, 100 under
-`Flush::OnRequest`, one at a time under `Flush::Each`.
+is flushed, in every mode. They replace in batches of the store's size, 100
+under `Flush::OnRequest` and `Flush::Never`, one at a time under `Flush::Each`.
 
 Several threads and several processes can write into one store without
 coordination: temporary names are unique per writer, and two writers storing
