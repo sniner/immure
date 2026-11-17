@@ -769,7 +769,9 @@ impl Store {
     ///
     /// [`Error::Io`] when a file cannot be flushed or renamed, and
     /// [`Error::Obstructed`] as for [`add`](Store::add). Entries of the batch
-    /// that were not named when the error came are not in the store.
+    /// that were not named when the error came stay in the batch, and the
+    /// next flush tries them again. They are lost only when the last handle
+    /// is dropped before a flush succeeds.
     pub fn flush(&self) -> Result<()> {
         let (unnamed, unflushed) = {
             let mut pending = self.pending();
@@ -2153,12 +2155,22 @@ impl Store {
     }
 
     /// Name a batch, checking an entry that another writer put under a name
-    /// first against the digest.
-    fn name_batch(&self, batch: HashMap<Digest, Unnamed>) -> Result<()> {
-        name_all(batch, &self.protection, &|path, digest| {
+    /// first against the digest. An entry that could not be named goes back
+    /// into the open batch: the store still answers for it, and the next
+    /// flush tries it again.
+    fn name_batch(&self, mut batch: HashMap<Digest, Unnamed>) -> Result<()> {
+        let named = name_all(&mut batch, &self.protection, &|path, digest| {
             self.content_matches(path, digest)
-        })
-        .map_err(|err| self.root_gone(err))
+        });
+        if !batch.is_empty() {
+            let mut pending = self.pending();
+            for (digest, unnamed) in batch {
+                // A clone may have batched the same content meanwhile; one
+                // copy is enough, and the other goes with its temporary file.
+                pending.unnamed.entry(digest).or_insert(unnamed);
+            }
+        }
+        named.map_err(|err| self.root_gone(err))
     }
 
     /// The entries not flushed yet, whatever a panicking clone left there:
@@ -2501,7 +2513,7 @@ struct Unnamed {
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        let unnamed = mem::take(&mut self.unnamed);
+        let mut unnamed = mem::take(&mut self.unnamed);
         let unflushed = mem::take(&mut self.unflushed);
         if unnamed.is_empty() && unflushed.is_empty() {
             return;
@@ -2513,8 +2525,12 @@ impl Drop for Pending {
         );
         // Nothing to check a taken name against here: the reading side of the
         // store is gone. A name that another writer took holds its content.
-        if let Err(error) = name_all(unnamed, &self.protection, &|_, _| Ok(true)) {
-            warn!(%error, "a batch could not be named when the store was dropped");
+        if let Err(error) = name_all(&mut unnamed, &self.protection, &|_, _| Ok(true)) {
+            warn!(
+                %error,
+                lost = unnamed.len(),
+                "a batch could not be named when the store was dropped"
+            );
         }
         if let Err(error) = flush_named(&unflushed, &self.protection) {
             warn!(%error, "entries could not be flushed when the store was dropped");
@@ -2525,9 +2541,9 @@ impl Drop for Pending {
 /// Name a batch: its files flushed together, each renamed to its entry's
 /// name, the directories flushed together. `matches` checks an entry that
 /// another writer put under a name first. An error stops the batch; the
-/// entries not named by then are dropped with their temporary files.
+/// entries not named by then stay in `batch`, with their temporary files.
 fn name_all(
-    batch: HashMap<Digest, Unnamed>,
+    batch: &mut HashMap<Digest, Unnamed>,
     protection: &Protection,
     matches: &dyn Fn(&Path, &Digest) -> Result<bool>,
 ) -> Result<()> {
@@ -2547,22 +2563,29 @@ fn name_all(
     named
 }
 
-/// The renames of [`name_all`], collecting the directories they touched.
+/// The renames of [`name_all`], collecting the directories they touched. An
+/// entry leaves `batch` once it has its name, or another writer's entry under
+/// that name was checked.
 fn rename_all(
-    batch: HashMap<Digest, Unnamed>,
+    batch: &mut HashMap<Digest, Unnamed>,
     protection: &Protection,
     matches: &dyn Fn(&Path, &Digest) -> Result<bool>,
     dirs: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    for (digest, Unnamed { temp, dest, .. }) in batch {
-        if temp.name(&dest, protection)? {
-            debug!(path = %dest.display(), "entry stored");
-        } else if !matches(&dest, &digest)? {
-            return Err(Error::Obstructed(dest));
+    let digests: Vec<Digest> = batch.keys().cloned().collect();
+    for digest in digests {
+        let Some(unnamed) = batch.get_mut(&digest) else {
+            continue;
+        };
+        if unnamed.temp.name_kept(&unnamed.dest, protection)? {
+            debug!(path = %unnamed.dest.display(), "entry stored");
+        } else if !matches(&unnamed.dest, &digest)? {
+            return Err(Error::Obstructed(unnamed.dest.clone()));
         }
-        if let Some(dir) = dest.parent() {
+        if let Some(dir) = unnamed.dest.parent() {
             dirs.insert(dir.to_path_buf());
         }
+        batch.remove(&digest);
     }
     Ok(())
 }

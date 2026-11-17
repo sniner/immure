@@ -432,6 +432,53 @@ fn a_store_that_is_dropped_names_its_batch() {
     assert_eq!(fs::read(entry.path()).unwrap(), b"left in the batch");
 }
 
+/// A batch whose renames fail keeps its entries: the store still answers
+/// for them, and the flush after the trouble is over names them. Before
+/// 0.4.1 their temporary files were removed, and the next flush had nothing
+/// left to do and succeeded.
+#[cfg(unix)]
+#[test]
+fn a_batch_that_cannot_be_named_keeps_its_entries() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new().unwrap();
+    let store = batched_in(&dir, 3);
+    let (_, first) = store.add(b"first of the batch").unwrap();
+    let (_, second) = store.add(b"second of the batch").unwrap();
+    let shards: Vec<_> = [&first, &second]
+        .iter()
+        .map(|entry| entry.path().parent().unwrap().to_path_buf())
+        .collect();
+    for shard in &shards {
+        fs::set_permissions(shard, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    if fs::File::create(shards[0].join("probe")).is_ok() {
+        // Root writes where the mode forbids it; nothing to test then.
+        return;
+    }
+
+    // The third entry fills the batch, and naming the batch fails.
+    assert!(store.add(b"third of the batch").is_err());
+    assert!(store.flush().is_err(), "the trouble is still there");
+    for entry in [&first, &second] {
+        assert!(store.contains(entry.digest()).unwrap());
+        assert!(!entry.path().exists());
+    }
+    assert_eq!(
+        store.read(first.digest()).unwrap().unwrap(),
+        b"first of the batch"
+    );
+
+    for shard in &shards {
+        fs::set_permissions(shard, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    store.flush().unwrap();
+
+    assert_eq!(fs::read(first.path()).unwrap(), b"first of the batch");
+    assert_eq!(fs::read(second.path()).unwrap(), b"second of the batch");
+    assert_eq!(temp_files(store.root()).len(), 0);
+}
+
 #[test]
 fn an_entry_removed_from_its_batch_leaves_nothing_behind() {
     let dir = TempDir::new().unwrap();

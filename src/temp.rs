@@ -114,14 +114,22 @@ impl TempFile {
     /// key change, where the entry keeps its name — use
     /// [`replace`](TempFile::replace), where a rename that fails is a failure
     /// and nothing else.
-    pub(crate) fn persist(self, dest: &Path, protection: &Protection) -> Result<bool> {
+    pub(crate) fn persist(mut self, dest: &Path, protection: &Protection) -> Result<bool> {
         self.rename_to(dest, protection, true, true)
     }
 
     /// As [`persist`](TempFile::persist), without either flush: for a file the
     /// caller has already flushed, with its directory flushed afterwards by the
     /// caller too, or for a store that flushes only on request.
-    pub(crate) fn name(self, dest: &Path, protection: &Protection) -> Result<bool> {
+    pub(crate) fn name(mut self, dest: &Path, protection: &Protection) -> Result<bool> {
+        self.rename_to(dest, protection, true, false)
+    }
+
+    /// As [`name`](TempFile::name), for a file of a batch: the temporary file
+    /// is not given up. After an error it is still there and can be named
+    /// again. After `false` it is still there too and is removed when this is
+    /// dropped, like any temporary file that got no name.
+    pub(crate) fn name_kept(&mut self, dest: &Path, protection: &Protection) -> Result<bool> {
         self.rename_to(dest, protection, true, false)
     }
 
@@ -141,7 +149,7 @@ impl TempFile {
     /// that writes onto a name an entry already holds; nothing about it is
     /// specific to sealing.
     #[cfg(feature = "crypt")]
-    pub(crate) fn replace(self, dest: &Path, protection: &Protection) -> Result<()> {
+    pub(crate) fn replace(mut self, dest: &Path, protection: &Protection) -> Result<()> {
         self.rename_to(dest, protection, false, false).map(|_| ())
     }
 
@@ -157,7 +165,7 @@ impl TempFile {
     /// So a name that is taken is left alone, and what lies under it is for
     /// the caller to check.
     fn rename_to(
-        mut self,
+        &mut self,
         dest: &Path,
         protection: &Protection,
         may_lose: bool,

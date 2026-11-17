@@ -2,6 +2,16 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Fixed
+
+- **A batch that could not be named lost its entries**: when flushing or renaming failed (a full
+  disk, a share that went away), the temporary files of the entries not named yet were removed,
+  although `add` had answered for them, and the next `Store::flush` succeeded with nothing left
+  to do. These entries now stay in the batch, the store keeps answering for them, and the next
+  flush tries them again
+
 ## [0.4.0] - 2026-11-16
 
 ### Breaking changes
