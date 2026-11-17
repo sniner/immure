@@ -387,15 +387,61 @@ pub(crate) fn open_to_flush(path: &Path, protection: &Protection) -> io::Result<
     }
 }
 
-/// Flush the files at `paths` together: each handed to the device, then one
-/// device flush for all of them. A file that is gone is skipped when
-/// `missing_ok`, and an error otherwise.
+/// Files or directories that are flushed with one flush of the device.
+///
+/// On Apple platforms each is handed to the drive with a plain `fsync`, and
+/// the drive writes out its cache once at the end. On Linux, on a local
+/// filesystem known to take it, nothing is done per file and `syncfs` flushes
+/// the whole filesystem once at the end: one commit of its journal and one
+/// flush of the device, where an `fsync` per file costs one of each per file.
+/// Everywhere else every file gets its own `fsync`.
+struct Together {
+    last: Option<File>,
+    /// Whether one flush of the filesystem stands in for the flush of every
+    /// file. Decided with the first file: a batch lies in one store, and a
+    /// store in one filesystem.
+    whole: Option<bool>,
+}
+
+impl Together {
+    fn new() -> Self {
+        Together {
+            last: None,
+            whole: None,
+        }
+    }
+
+    /// Take one open file or directory into the flush.
+    fn add(&mut self, file: File) -> io::Result<()> {
+        let whole = *self
+            .whole
+            .get_or_insert_with(|| flushes_whole_filesystem(&file));
+        if !whole {
+            send_to_device(&file)?;
+        }
+        self.last = Some(file);
+        Ok(())
+    }
+
+    /// Flush the device. Everything added is durable when this returns.
+    fn finish(self) -> io::Result<()> {
+        match (self.last, self.whole) {
+            (Some(file), Some(true)) => flush_filesystem(&file),
+            (Some(file), _) => flush_device(&file),
+            (None, _) => Ok(()),
+        }
+    }
+}
+
+/// Flush the files at `paths` together, with one flush of the device where
+/// the platform has a way to (see [`Together`]). A file that is gone is
+/// skipped when `missing_ok`, and an error otherwise.
 pub(crate) fn flush_files<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
     protection: &Protection,
     missing_ok: bool,
 ) -> Result<()> {
-    let mut last = None;
+    let mut together = Together::new();
     for path in paths {
         let file = match open_to_flush(path, protection) {
             Ok(file) => file,
@@ -407,35 +453,121 @@ pub(crate) fn flush_files<'a>(
                 return Err(err).ctx(|| format!("{}: opening to flush", path.display()));
             }
         };
-        send_to_device(&file).ctx(|| format!("{}: flushing to device", path.display()))?;
-        last = Some((file, path));
+        together
+            .add(file)
+            .ctx(|| format!("{}: flushing to device", path.display()))?;
     }
-    if let Some((file, path)) = last {
-        flush_device(&file).ctx(|| format!("{}: flushing the device", path.display()))?;
-    }
-    Ok(())
+    together.finish().ctx(|| "flushing the device".to_string())
 }
 
 /// Flush the directories at `paths` together, the way [`flush_files`] does
 /// files. Best effort, like the directory flush after a single entry.
 pub(crate) fn flush_dirs<'a>(paths: impl IntoIterator<Item = &'a Path>) {
-    let mut last = None;
+    let mut together = Together::new();
     for path in paths {
         match File::open(path) {
             Ok(dir) => {
-                if let Err(err) = send_to_device(&dir) {
+                if let Err(err) = together.add(dir) {
                     debug!(path = %path.display(), %err, "directory sync failed");
                 }
-                last = Some((dir, path));
             }
             Err(err) => debug!(path = %path.display(), %err, "directory not open-able for sync"),
         }
     }
-    if let Some((dir, path)) = last {
-        if let Err(err) = flush_device(&dir) {
-            debug!(path = %path.display(), %err, "device flush after the directories failed");
+    if let Err(err) = together.finish() {
+        debug!(%err, "device flush after the directories failed");
+    }
+}
+
+/// Flush the files or directories at `paths` together, the way a store
+/// flushes a batch: with one flush of the device where the platform has a
+/// way to, and with an `fsync` each where it has none. For a caller that
+/// writes several files of its own and wants them durable together.
+///
+/// On Linux this is one `syncfs` when the first path lies on ext4, XFS,
+/// Btrfs, F2FS or ZFS, and every path has to lie on that same filesystem.
+/// `syncfs` reports a failed write only since Linux 5.8.
+///
+/// # Errors
+///
+/// The error of opening a path for reading, or of a flush.
+pub fn flush_together<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> io::Result<()> {
+    let mut together = Together::new();
+    for path in paths {
+        together.add(File::open(path)?)?;
+    }
+    together.finish()
+}
+
+/// Whether `syncfs` on `file` makes every file of its filesystem durable,
+/// so that the files of a batch need no `fsync` of their own.
+///
+/// Only for filesystems where that is known: local ones that commit their
+/// journal and flush the device in `syncfs`. A network filesystem or FUSE
+/// passes an `fsync` on to the server, but not necessarily a `syncfs`, so
+/// those keep the `fsync` per file. So does a system where `syncfs` is
+/// refused, which a sandbox can do: it is tried once per process, here,
+/// before any `fsync` is left out because of it.
+#[cfg(target_os = "linux")]
+fn flushes_whole_filesystem(file: &File) -> bool {
+    use std::sync::atomic::AtomicU8;
+
+    const EXT: u64 = 0xEF53;
+    const XFS: u64 = 0x5846_5342;
+    const BTRFS: u64 = 0x9123_683E;
+    const F2FS: u64 = 0xF2F5_2010;
+    const ZFS: u64 = 0x2FC1_2FC1;
+
+    const UNTRIED: u8 = 0;
+    const WORKS: u8 = 1;
+    const REFUSED: u8 = 2;
+    static SYNCFS: AtomicU8 = AtomicU8::new(UNTRIED);
+
+    let Ok(stat) = rustix::fs::fstatfs(file) else {
+        return false;
+    };
+    // The type of `f_type` differs between architectures; the magic numbers
+    // are 32 bits wide on all of them.
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    let kind = (stat.f_type as u64) & 0xFFFF_FFFF;
+    if ![EXT, XFS, BTRFS, F2FS, ZFS].contains(&kind) {
+        return false;
+    }
+    match SYNCFS.load(Ordering::Relaxed) {
+        WORKS => true,
+        REFUSED => false,
+        _ => {
+            let works = flush_filesystem(file).is_ok();
+            if !works {
+                debug!("syncfs refused, flushing every file by itself");
+            }
+            SYNCFS.store(if works { WORKS } else { REFUSED }, Ordering::Relaxed);
+            works
         }
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn flushes_whole_filesystem(_file: &File) -> bool {
+    false
+}
+
+/// Flush the filesystem `file` lies on, with `syncfs`: every file and
+/// directory of it is durable when this returns.
+#[cfg(target_os = "linux")]
+fn flush_filesystem(file: &File) -> io::Result<()> {
+    loop {
+        match rustix::fs::syncfs(file) {
+            Err(rustix::io::Errno::INTR) => {}
+            other => return other.map_err(io::Error::from),
+        }
+    }
+}
+
+/// Never called: [`flushes_whole_filesystem`] is false here.
+#[cfg(not(target_os = "linux"))]
+fn flush_filesystem(file: &File) -> io::Result<()> {
+    flush_device(file)
 }
 
 /// Whether a failed `F_FULLFSYNC` means the filesystem does not offer it, as

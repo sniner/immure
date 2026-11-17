@@ -129,10 +129,15 @@
 //! On macOS a device flush is `F_FULLFSYNC`, which has the drive write out its
 //! cache; a batch hands each file to the drive with a plain `fsync` and flushes
 //! the drive once. On filesystems without `F_FULLFSYNC`, such as SMB mounts,
-//! `fsync` is used. Elsewhere `fsync` flushes the device by itself, and a batch
-//! saves the waiting rather than the flushes. [`send_to_device`] and
-//! [`flush_device`] are the two halves for files the caller writes itself, and
-//! [`sync_file`] is both at once.
+//! `fsync` is used. On Linux a batch on ext4, XFS, Btrfs, F2FS or ZFS is
+//! flushed with one `syncfs` instead of an `fsync` per file: one commit of the
+//! journal and one flush of the device per step, whatever the size of the
+//! batch. `syncfs` flushes everything on that filesystem, also what other
+//! processes wrote, and reports a failed write only since Linux 5.8. Elsewhere
+//! `fsync` flushes the device by itself, and a batch saves the waiting rather
+//! than the flushes. [`flush_together`] flushes files the caller writes itself
+//! the same way; [`send_to_device`] and [`flush_device`] are the two halves
+//! of a flush on macOS, and [`sync_file`] is both at once.
 //!
 //! Concurrency needs no coordination: writers pick unique temporary names, and
 //! two processes storing the same bytes race to rename identical content into
@@ -249,4 +254,4 @@ pub use store::{
     Builder, Conversion, DEFAULT_BATCH, DEFAULT_DEPTH, DEFAULT_TEMP_MIN_AGE, Entries, Entry,
     Failure, Flush, Quarantined, Status, Store,
 };
-pub use temp::{flush_device, send_to_device, sync_file};
+pub use temp::{flush_device, flush_together, send_to_device, sync_file};

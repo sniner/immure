@@ -2,6 +2,22 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
+## [Unreleased]
+
+### Added
+
+- **`flush_together`** flushes files or directories the caller wrote itself the way a store flushes
+  a batch: with one flush of the device where the platform has a way to
+
+### Changed
+
+- **A batch on Linux is flushed with `syncfs`** when the store lies on ext4, XFS, Btrfs, F2FS or
+  ZFS: one commit of the journal and one flush of the device before the renames and one after,
+  where every file and every shard directory had an `fsync` of its own. Storing 3,000 small files
+  in batches of 1,000 took 11.6 s on Btrfs before and 0.5 s now. `syncfs` flushes everything on
+  that filesystem, also what other processes wrote, and reports a failed write only since
+  Linux 5.8. Other filesystems, network mounts and FUSE among them, keep the `fsync` per file
+
 ## [0.4.1] - 2026-11-17
 
 ### Fixed

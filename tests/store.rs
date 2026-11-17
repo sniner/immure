@@ -480,6 +480,25 @@ fn a_batch_that_cannot_be_named_keeps_its_entries() {
 }
 
 #[test]
+fn files_of_the_caller_are_flushed_together() {
+    let dir = TempDir::new().unwrap();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    fs::write(&first, b"one").unwrap();
+    fs::write(&second, b"two").unwrap();
+
+    immure::flush_together([&first, &second]).unwrap();
+    immure::flush_together([dir.path()]).unwrap();
+    immure::flush_together(Vec::<&std::path::Path>::new()).unwrap();
+
+    let gone = dir.path().join("gone");
+    assert_eq!(
+        immure::flush_together([&first, &gone]).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
 fn an_entry_removed_from_its_batch_leaves_nothing_behind() {
     let dir = TempDir::new().unwrap();
     let store = batched_in(&dir, 10);
