@@ -2,7 +2,7 @@
 
 Format based on [Keep a Changelog](https://keepachangelog.com).
 
-## [Unreleased]
+## [0.5.0] - 2026-11-17
 
 ### Breaking changes
 
